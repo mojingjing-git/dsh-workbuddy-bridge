@@ -63,17 +63,31 @@ still account data, and they should not be on the public mirror.
 
 ## What we are asking GitHub to do
 
-Purge the following object SHAs from the public mirror's object store (and from any cache, CDN, or fork that has a copy):
+Purge the following object SHAs from the public mirror's object store (and from any cache, CDN, or fork that has a copy).
+
+**Generation 1 — account identifiers only** (superseded by the second rewrite but still reachable by SHA):
 
 | SHA | Why |
 |---|---|
-| `REDACTED-SHA` (commit) | Direct ancestor of the prior `p0-probe` HEAD; its three tree blobs contain the PII URLs above. |
-| `REDACTED-SHA` (commit) | The previous `p0-probe` HEAD, whose only difference from the new HEAD is that it sits one commit closer to `REDACTED-SHA` in the now-deleted branch. Force-push already removed the ref but the object itself is still in the mirror. |
-| `REDACTED-SHA` (commit) | P1 v0.1 commit that is reachable from `REDACTED-SHA`. |
+| `REDACTED-SHA` (commit) | Contains `docs/probe/p0/M06-status.json` and the two `M03-login-start-*.json` files with real `uid`, `nickname`, credit counters, token counters and OAuth `state` values. |
+| `REDACTED-SHA` (commit) | Descendant of the above. |
+| `REDACTED-SHA` (commit) | Descendant of the above. |
+| `REDACTED-SHA...` through `REDACTED-SHA...` (six commits, see the branch reflog before the 2026-10-10 rewrite) | Second-generation branch. Its prose files restated the same account identifiers. |
 
-The tree and blob SHAs that those commits contain are the things actually being requested — commit SHAs are listed for context so the corresponding tree / blob SHAs can be derived by inspecting each commit's tree.
+**Generation 2 — a live API key.** This is the more serious one:
 
-If a broader removal is possible (e.g. purging all objects un-referenced after the force-push), that is the preferred outcome.
+| SHA | Why |
+|---|---|
+| `REDACTED-SHA` (commit) | Introduced `docs/probe/BATCH2-E2E-RUNBOOK.md`, which printed the user's wb2api API key verbatim in two places. The key is a Bearer credential for the gateway, not merely an identifier. |
+| `REDACTED-SHA` (commit) | The branch HEAD that carried the same file. **Verified still reachable at the time of writing**: `https://raw.githubusercontent.com/mojingjing-git/dsh-workbuddy-bridge/REDACTED-SHA/docs/probe/BATCH2-E2E-RUNBOOK.md` returns HTTP 200 with the key in lines 12 and 62. |
+
+The current `p0-probe` HEAD is `REDACTED-SHA`, whose working tree contains no real value of any kind.
+
+**Note on the API key**: the user has been told to rotate it in the gateway. Rotation is the only remedy that actually invalidates the leaked value; purging the mirror only removes one copy of it. The purge request is still being filed because the key should not remain readable after rotation either — an old key can reveal the gateway's shape, and a rotation that is later reverted would re-expose it.
+
+The tree and blob SHAs those commits contain are the things actually being requested — commit SHAs are listed for context so the corresponding tree / blob SHAs can be derived by inspecting each commit's tree.
+
+If a broader removal is possible (e.g. purging all objects un-referenced after the force-pushes), that is the preferred outcome.
 
 ## Why we cannot solve this locally
 
@@ -95,13 +109,18 @@ We considered that path. The reasons we did not take it:
 
 ## Reproduction steps for GitHub Support to confirm
 
-1. From any environment, run:
-   ```
-   curl -sS https://raw.githubusercontent.com/mojingjing-git/dsh-workbuddy-bridge/REDACTED-SHA/docs/probe/p0/M06-status.json
-   ```
-2. Confirm the response is HTTP 200 and contains real-looking wb2api account identifiers and exact credit / token counts.
-3. Compare with the new HEAD (`REDACTED-SHA`) of the same path: it returns the same shape with `_scrubbed: true` and `scrubbed-*` placeholders.
-4. Confirm that `git log` on the current `p0-probe` branch does not list `REDACTED-SHA`.
+Generation 2 (the API key — start here, it is the higher-severity one):
+
+1. `curl -sS https://raw.githubusercontent.com/mojingjing-git/dsh-workbuddy-bridge/REDACTED-SHA/docs/probe/BATCH2-E2E-RUNBOOK.md`
+2. Confirm HTTP 200 and that lines 12 and 62 contain a literal API key.
+3. Compare with the current HEAD (`REDACTED-SHA`) at the same path: it reads `api_key` from the reader's own `config.json` and prints `<WB2API_API_KEY_VALUE>`.
+
+Generation 1 (account identifiers):
+
+4. `curl -sS https://raw.githubusercontent.com/mojingjing-git/dsh-workbuddy-bridge/REDACTED-SHA/docs/probe/p0/M06-status.json`
+5. Confirm HTTP 200 with real-looking account identifiers and exact counters.
+6. Compare with the current HEAD at the same path: same shape, `_scrubbed: true`, `scrubbed-*` placeholders and round synthetic counters.
+7. Confirm that `git log` on the current `p0-probe` branch lists neither `REDACTED-SHA` nor `REDACTED-SHA`.
 
 ## Contact
 
