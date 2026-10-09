@@ -32,6 +32,10 @@ Thumbs.db
 *.swo
 *~
 
+# Git credential helpers (gh CLI drops these in the repo root)
+.gh-token/
+.git-helper/
+
 # Secrets / runtime
 .env
 .env.local

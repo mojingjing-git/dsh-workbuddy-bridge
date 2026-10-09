@@ -45,9 +45,16 @@ binaries; the user is always the one driving installs / upgrades.
 | P2 Managed (self-build + lifecycle) | — |
 | P3 Update + Publish | — |
 
-The full V2.2.1 plan (`dsh-workbuddy-bridge-plan-v2.2.1.md`) and the change
-log against the previous iteration
-(`REVIEW-CHANGELOG-v2.2-to-v2.2.1.md`) live in this repository.
+The full V2.2.1 plan and review trail live in [`docs/`](./docs/):
+
+- [`docs/planning/plan-v2.2.1.md`](./docs/planning/plan-v2.2.1.md) — cleared
+  baseline (≈ 1 050 lines), cleared by three independent agent reviews.
+- [`docs/planning/survey.md`](./docs/planning/survey.md) — earlier combined
+  survey of the upstream gateway and DSH plugin model.
+- [`docs/review/REVIEW-CHANGELOG-v2.2-to-v2.2.1.md`](./docs/review/REVIEW-CHANGELOG-v2.2-to-v2.2.1.md) —
+  second-round review log + 25-row fact-correction table.
+- [`docs/review/REVIEW-CHANGELOG-v2.1-to-v2.2.md`](./docs/review/REVIEW-CHANGELOG-v2.1-to-v2.2.md) —
+  first-round review log.
 
 ## License
 
