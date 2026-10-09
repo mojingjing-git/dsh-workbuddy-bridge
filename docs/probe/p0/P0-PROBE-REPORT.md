@@ -2,7 +2,7 @@
 
 > Date: 2026-10-10
 > DSH reference: `dsh-v0.2.1-alpha.2`
-> wb2api reference: `linguo2625469/workbuddy2api-panel@main` (HEAD `REDACTED-UPSTREAM-SHA`)
+> wb2api reference: `linguo2625469/workbuddy2api-panel@main` (HEAD `d66384d9e3d69655f799d7d8f2e5fba1946e00ab`)
 > Local wb2api: `C:\Users\MoJingJing\Desktop\Workbuddy2api\wb2api.exe` on `127.0.0.1:7863`
 > Source files: see sibling `M0X-*` files in this directory
 

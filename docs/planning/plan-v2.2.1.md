@@ -4,7 +4,7 @@
 > 状态：**V2.2.1 = V2.2 + 第二轮复审 5 条 P0 前清理 + P1 顺手改**；架构与阶段不变；剩余 P2/P3 修订在对应阶段边界合并
 > 目标：将本人持有的腾讯 CodeBuddy / WorkBuddy 账号，通过现有 WorkBuddy2API 网关，以 DSH 插件的形式实现**账号认证、模型选择、余额观察、网关管理与可选的一键自构建**。
 > 拟发布包：`dsh-workbuddy-bridge`；插件自身拟采用 MIT。
-> 基准上游：`linguo2625469/workbuddy2api-panel` `v1.13.0`（2026-10-08），tag 对应 commit `REDACTED-UPSTREAM-SHA`。
+> 基准上游：`linguo2625469/workbuddy2api-panel` `v1.13.0`（2026-10-08），tag 对应 commit `d66384d9e3d69655f799d7d8f2e5fba1946e00ab`。
 > DSH 参考版本：`dsh-v0.2.1-alpha.2`（2026-10-09）；落地时以用户实际安装的 DSH 版本/API 为准。
 > 审查原则：下面分为**源码已核实事实**、**设计决定**及**仍需真实环境验证的假设**，不得把计划当作实测报告。
 > 本版本相对 V2.2 的变更摘要见 `REVIEW-CHANGELOG-v2.2-to-v2.2.1.md`。
@@ -577,7 +577,7 @@ $DSH_HOME/workbuddy-bridge/
 1. UI 告知第三方源码、来源、下载项目/规模与潜在服务条款风险；用户点击「构建并安装」。
 2. 检查已有本机 Go 是否满足固定构建版本；否则经同意下载 **官方 Go 工具链**并核对可信发布摘要，禁止执行未验证的安装脚本。
    > **DSH pnpm 11 兼容说明**：Go 工具链以官方二进制 tar.gz / zip 形式下载并解压到 `cache/toolchain/<go-version>/<plat-arch>/`，**不在** `package.json` 中添加 `postinstall`，以兼容 DSH 桌面端 pnpm 11 的默认禁用设置。下载与校验使用 Node 原生 fetch + 用户确认 UI 控制。
-3. 固定上游 `v1.13.0` 对应 commit `REDACTED-UPSTREAM-SHA`；从已打包的源码或已锁定可信归档恢复到隔离 staging；校验来源完整性。
+3. 固定上游 `v1.13.0` 对应 commit `d66384d9e3d69655f799d7d8f2e5fba1946e00ab`；从已打包的源码或已锁定可信归档恢复到隔离 staging；校验来源完整性。
 4. 使用锁定 `go.mod`/`go.sum` 解析模块；尽量采用可信模块代理与 checksum database，处理离线和代理失败；不修改原用户 Go 环境。
 5. 以受控参数执行 `go build -trimpath -o <staging-binary> ./cmd/server`（构建入口应先以目标 tag 在三平台实际验证）；记录 Go 版本、目标 OS/arch、exit code、产物 SHA256、构建日志末尾。
 6. 运行 `--help` 或安全的 smoke test（以真实 CLI 支持情况核验，当前 Go main 以 `-config` 接收配置），单独绑定回环随机端口，验证 `/healthz` 服务身份与基本路由，再停止测试进程。
@@ -946,7 +946,7 @@ V2.2 §11.5 第 8 项写了"三平台不具备真实环境时该项标注'未验
 **禁止先写大而全的插件。按以下顺序执行并提交证据：**
 
 1. 读取用户实际 DSH 版本、当前 wb2api 启动方式与配置**路径**；只需记录路径和脱敏字段，不要向模型输出任何 token。
-2. 固定上游代码：wb2api `v1.13.0` / `REDACTED-UPSTREAM-SHA`；记录 DSH 安装版本，不凭猜测使用 `ctx` API。
+2. 固定上游代码：wb2api `v1.13.0` / `d66384d9e3d69655f799d7d8f2e5fba1946e00ab`；记录 DSH 安装版本，不凭猜测使用 `ctx` API。
 3. 先在现有 DSH 环境通过最小 `openai-completions` route，用 `glm-5.2`（或其他确实可用裸模型 ID）测试真实 Agent 及 tool-call；失败即停在 P0。
 4. 使用已验证的 Host/Client API 实现 Attach MVP；每个功能都要有单测和真实环境验收。
 5. UI、网关 REST、provider 配置、凭证存储、进程管理分层；禁止让 UI 自行访问网关 Token 或 OS 文件。
