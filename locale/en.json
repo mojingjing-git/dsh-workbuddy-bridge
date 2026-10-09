@@ -1,0 +1,10 @@
+{
+  "name": "dsh-workbuddy-bridge",
+  "description": "Attach a local WorkBuddy2API gateway to DeepSeek Harness.",
+  "workbuddy.status.configured": "WorkBuddy: {realm}",
+  "workbuddy.status.off": "WorkBuddy: off",
+  "workbuddy.status.starting": "WorkBuddy: starting…",
+  "workbuddy.action.signIn": "Sign in with WorkBuddy",
+  "workbuddy.error.noKey": "No API key resolved. Set {env} or paste the key in DSH Models page.",
+  "workbuddy.error.noRoute": "No provider route configured. Set providers.workbuddy in DSH Models page."
+}

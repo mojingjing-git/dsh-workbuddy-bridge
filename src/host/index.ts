@@ -1,0 +1,302 @@
+/**
+ * Host half of dsh-workbuddy-bridge.
+ *
+ * Plan reference: V2.2.1 §0, §3.2, §5, §6, M01-M10 evidence.
+ *
+ * The host does **not** extend a class. It exports three cordis-plugin
+ * symbols plus an `apply` entry, the same shape as
+ * `@deepseek-ai/dsh-llm-pi-ai/src/index.ts` (M02 evidence line 93-94,
+ * 149) and `dsh-cost-meter/lib/index.js` line 45, 3237 — the two real
+ * host plugins we have on disk.
+ *
+ * Pipeline inside `apply`:
+ *
+ *   1. resolve the workbuddy route config (default: empty)
+ *   2. read the API key from `ctx.credentials` (or fall back to the
+ *      `apiKey` literal override, used in tests)
+ *   3. start the local management HTTP server (dsh-cost-meter contract)
+ *   4. register the LLM adapter (route "workbuddy")
+ *   5. register model discovery against `/v1/models`
+ *   6. register the configurable provider so it shows in the Models page
+ *   7. register the OAuth flow via `ctx.authorization`
+ *   8. return disposers via `ctx.effect`
+ *
+ * Step 1-2 may fail (no route, no key) — when so, we log and skip the
+ * downstream steps; the plugin is always loaded and the UI always
+ * available, so the user can fix the config and the host hot-reloads
+ * (`Config` is `.volatile()`).
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+
+import { Config, type WorkbuddyConfig, type WorkbuddyProviderConfig } from './schema.js'
+import {
+  PLUGIN_NAME,
+  DEFAULT_WB2API_BASEURL,
+  COST_METER_CREDITS_PATH,
+} from '../shared/constants.js'
+import { WorkbuddyClient } from './workbuddy-client.js'
+import { WorkbuddyLlmAdapter, WORKBUDDY_PROVIDER } from './llm-adapter.js'
+import {
+  startManagementServer,
+  defaultManagementKey,
+  type ManagementServerHandle,
+} from './http-server.js'
+import {
+  registerWorkbuddyOAuthFlow,
+  type AuthorizationService,
+  type CredentialsService,
+} from './auth-flow.js'
+
+export const name = PLUGIN_NAME
+
+/**
+ * Services the host depends on at apply time.
+ *
+ * - `llm` — the LLM registry; we register a workbuddy route against it
+ * - `authorization` — the dsh-authorization seam; we register the OAuth flow
+ * - `credentials` — used to read the wb2api API key + write the bound marker
+ */
+export const inject = ['llm', 'authorization', 'credentials'] as const
+
+export { Config }
+
+/**
+ * DSH bundle shape of `ctx.inject([name], cb)` (M02 evidence: the bundle
+ * invokes the callback with the resolved service, or `undefined` if the
+ * service is not mounted).
+ */
+export interface InjectCallback<T> {
+  (service: T): void
+}
+
+export interface InjectFn {
+  <K extends string>(names: readonly K[], cb: InjectCallback<unknown>): void
+  /** Single-name convenience used by dsh-cost-meter (`ctx.inject(['settings'], cb)`). */
+  <K extends string>(name: K, cb: InjectCallback<unknown>): void
+}
+
+export interface EffectFn {
+  (gen: (this: Context) => Generator<() => void, void, void>, label: string): void
+}
+
+export interface EventOnFn {
+  (event: string, cb: (...args: unknown[]) => void): void
+}
+
+export interface GetFn {
+  (name: string): unknown
+}
+
+export interface LoggerLike {
+  info(message: string): void
+  warn(message: string): void
+  error(message: string): void
+  debug(message: string): void
+}
+
+export interface WorkbuddyPluginContext {
+  inject: InjectFn
+  effect: EffectFn
+  on: EventOnFn
+  get: GetFn
+  logger: LoggerLike
+  /** Provided by the loader so the apply's child contexts can address us. */
+  fiber?: { entry?: { options?: { id?: string } } }
+}
+
+export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): void {
+  const route = config.providers.workbuddy
+
+  if (route === undefined) {
+    ctx.logger.info(
+      'workbuddy: no provider route configured yet. Set providers.workbuddy in DSH Models page to attach.',
+    )
+    // Still mount a thin shell so the UI can prompt the user.
+    ctx.inject(['authorization'], () => {
+      // No-op until route is configured.
+    })
+    return
+  }
+
+  // Resolve API key. We try (in order):
+  //   1. route.apiKey (test override or literal user value)
+  //   2. ctx.credentials resolving the env-var name from route.apiKeyEnv
+  //   3. the env var directly (fallback when no credentials service exists)
+  resolveApiKey(ctx, route).then((apiKey) => {
+    if (apiKey === undefined) {
+      ctx.logger.warn(
+        `workbuddy: no API key resolved (apiKeyEnv="${route.apiKeyEnv}"). ` +
+          'Set the env var or enter the key in DSH Models page.',
+      )
+      // Mount the OAuth flow anyway so the user can sign in.
+      mountOAuthFlow(ctx, route).catch((e) => ctx.logger.error(`workbuddy oauth: ${(e as Error).message}`))
+      return
+    }
+    mountEverything(ctx, route, apiKey).catch((e) =>
+      ctx.logger.error(`workbuddy host mount failed: ${(e as Error).message}`),
+    )
+  })
+}
+
+async function mountEverything(
+  ctx: WorkbuddyPluginContext,
+  route: WorkbuddyProviderConfig,
+  apiKey: string,
+): Promise<void> {
+  const baseURL = (route.baseURL ?? DEFAULT_WB2API_BASEURL).replace(/\/+$/, '')
+  const realm = route.realm
+
+  const client = new WorkbuddyClient({ baseURL, apiKey })
+  const managementKey = defaultManagementKey()
+
+  // 1) Local management HTTP server (M08 contract).
+  const mgmt: ManagementServerHandle = await startManagementServer({
+    client,
+    managementKey,
+  })
+  ctx.effect(function* () {
+    yield async () => {
+      await mgmt.close()
+    }
+  }, 'workbuddy: management server lifecycle')
+
+  ctx.logger.info(
+    `workbuddy: management server bound at ${mgmt.baseURL}${COST_METER_CREDITS_PATH}`,
+  )
+
+  // 2) LLM adapter (M02 contract).
+  const adapter = new WorkbuddyLlmAdapter(client)
+
+  // 3) Inject the LLM service and register.
+  const llm = ctx.get('llm') as
+    | {
+        registerAdapter(routes: string[], adapter: unknown): { replace: (next: string[]) => void; (): void }
+        registerConfigurableProviders(entries: readonly unknown[]): { replace: (next: readonly unknown[]) => void; (): void }
+        registerModelDiscovery(
+          settingsNs: string,
+          discover: (req: unknown, signal?: AbortSignal) => Promise<readonly unknown[]>,
+        ): () => void
+      }
+    | undefined
+
+  if (llm === undefined) {
+    ctx.logger.error('workbuddy: ctx.get("llm") returned undefined; LLM route not registered')
+  } else {
+    const handle = llm.registerAdapter([WORKBUDDY_PROVIDER], adapter)
+    ctx.effect(function* () {
+      yield () => handle()
+    }, 'workbuddy: llm adapter lifecycle')
+
+    const directoryEntry = {
+      provider: WORKBUDDY_PROVIDER,
+      displayName: 'WorkBuddy / CodeBuddy',
+      settingsNs: 'workbuddy',
+      settingsPath: ['providers', 'workbuddy'],
+    }
+    const dirHandle = llm.registerConfigurableProviders([directoryEntry])
+    ctx.effect(function* () {
+      yield () => dirHandle()
+    }, 'workbuddy: llm directory lifecycle')
+
+    const discover = async (
+      request: unknown,
+      signal?: AbortSignal,
+    ): Promise<readonly unknown[]> => {
+      const r = (request ?? {}) as { provider?: string; baseURL?: string }
+      // The Models page passes a draft request — we always serve the workbuddy
+      // route's discovered model list. If the user is interrogating another
+      // baseURL, fall back to the cached list.
+      if (r.provider !== undefined && r.provider !== WORKBUDDY_PROVIDER) return []
+      const list = await adapter.listModels(WORKBUDDY_PROVIDER)
+      return list.map((m) => ({
+        id: m.id,
+        name: m.name,
+      }))
+    }
+    const discoverHandle = llm.registerModelDiscovery('workbuddy', discover)
+    ctx.effect(function* () {
+      yield () => discoverHandle()
+    }, 'workbuddy: model discovery lifecycle')
+
+    ctx.logger.info(
+      `workbuddy: LLM route registered against ${baseURL} (management port ${mgmt.port}, realm ${realm})`,
+    )
+  }
+
+  // 4) OAuth flow (M10 contract).
+  await mountOAuthFlow(ctx, route, client)
+}
+
+async function mountOAuthFlow(
+  ctx: WorkbuddyPluginContext,
+  route: WorkbuddyProviderConfig,
+  client?: WorkbuddyClient,
+): Promise<void> {
+  // If we don't have a client (no key yet), build one without one. The flow
+  // will resolve its own key from the credentials service.
+  const c = client ?? new WorkbuddyClient({ baseURL: route.baseURL ?? DEFAULT_WB2API_BASEURL, apiKey: '' })
+
+  const authorization = ctx.get('authorization') as AuthorizationService | undefined
+  const credentials = ctx.get('credentials') as CredentialsService | undefined
+  if (authorization === undefined || credentials === undefined) {
+    ctx.logger.warn(
+      'workbuddy: ctx.authorization or ctx.credentials not available; OAuth flow not registered. ' +
+        'This usually means the DSH desktop bundle does not enable dsh-authorization or dsh-credentials.',
+    )
+    return
+  }
+
+  // For the OAuth flow, we need a WorkbuddyClient that can reach the auth
+  // endpoints. The client needs a key for /panel/api/* which requires Bearer
+  // auth (M03 evidence). We resolve the same key the LLM uses.
+  if (!client) {
+    const apiKey = await resolveApiKey(ctx, route)
+    if (apiKey === undefined) {
+      ctx.logger.warn('workbuddy: cannot register OAuth flow without a resolvable API key')
+      return
+    }
+    c.apiKey = apiKey
+  }
+
+  registerWorkbuddyOAuthFlow({
+    authorization,
+    credentials,
+    workbuddy: c,
+    realm: route.realm,
+  })
+  ctx.logger.info('workbuddy: OAuth flow registered')
+}
+
+/**
+ * Resolve the wb2api API key for the workbuddy route.
+ *
+ * Order:
+ *   1. `route.apiKey` (literal, intended for tests and one-off local use)
+ *   2. `ctx.credentials.resolve(route.apiKeyEnv)` (DSH credential store)
+ *   3. `process.env[route.apiKeyEnv]` (plain environment, no DSH)
+ */
+async function resolveApiKey(
+  ctx: WorkbuddyPluginContext,
+  route: WorkbuddyProviderConfig,
+): Promise<string | undefined> {
+  if (route.apiKey !== undefined && route.apiKey.length > 0) {
+    return route.apiKey
+  }
+  // Try DSH credentials first.
+  const credentials = ctx.get('credentials') as
+    | { resolve(ref: { name: string; value: string }): Promise<{ value: string } | undefined> }
+    | undefined
+  if (credentials !== undefined) {
+    try {
+      const hit = await credentials.resolve({ name: route.apiKeyEnv, value: '' })
+      if (hit !== undefined && hit.value.length > 0) return hit.value
+    } catch {
+      // fall through to env
+    }
+  }
+  // Plain environment fallback.
+  const v = process.env[route.apiKeyEnv]
+  if (typeof v === 'string' && v.length > 0) return v
+  return undefined
+}

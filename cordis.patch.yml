@@ -1,0 +1,22 @@
+# dsh-workbuddy-bridge — DSH host bundle patch.
+#
+# M01 evidence: each row in the `insert:` list is a host or client half
+# of a plugin. The `id` is the shared identifier the runtime uses to
+# match host-side and client-side packages; the `name` is the npm-style
+# name the loader resolves to. V2.2.1 §3.2 has a 7-item probe checklist
+# that was closed by M01; this file is the concrete artefact.
+#
+# We register a single host row. The client half ships via
+# `package.json#dsh.client.inject` (M01: decoration template) — the
+# client bundle loader picks up `./client.js` automatically because of
+# the `./client` export.
+
+- insert:
+    - id: workbuddy
+      name: dsh-workbuddy-bridge
+      config:
+        providers:
+          workbuddy:
+            apiKeyEnv: WB2API_API_KEY
+            baseURL: http://127.0.0.1:7863
+            realm: cn

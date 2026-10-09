@@ -1,0 +1,171 @@
+{
+  "_scrubbed": true,
+  "_note": "Synthetic fixture. Every account-identifying value (uid, nickname) AND every account-data value (credit counters, token counters, timestamps) has been replaced with an obviously synthetic placeholder. Field names, types, and structural shape are preserved so this file is still usable as a contract fixture for dsh-cost-meter's parseWorkBuddyCredits(). The credit arithmetic is self-consistent: used = total - remaining (account A: 4000 - 3000 = 1000; account B: 2000 - 1500 = 500).",
+  "accounts": [
+    {
+      "uid": "scrubbed-uid-aaaa-bbbb-cccc-dddddddddddd",
+      "nickname": "scrubbed-nickname-A",
+      "credits": 3000,
+      "credits_total": 4000,
+      "credits_earliest_expiry": "2030-01-01T00:00:00+08:00",
+      "credits_earliest_remaining": 200,
+      "cooling": false,
+      "until": "0001-01-01T00:00:00Z",
+      "rate_limited_models": [
+        {
+          "model": "CN:glm-5.2",
+          "kind": "model_unavailable",
+          "until": "2030-01-01T00:05:00+08:00",
+          "reset_at": "0001-01-01T00:00:00Z",
+          "reason": "11102 model not available"
+        },
+        {
+          "model": "cH:glm-5.2",
+          "kind": "model_unavailable",
+          "until": "2030-01-01T00:05:00+08:00",
+          "reset_at": "0001-01-01T00:00:00Z",
+          "reason": "11102 model not available"
+        }
+      ],
+      "realm": "cn",
+      "disabled": false,
+      "success_count": 1000,
+      "last_success": "2030-01-01T00:00:00+08:00",
+      "last_err": "0001-01-01T00:00:00Z",
+      "token_usage": {
+        "request_count": 1000,
+        "usage_count": 950,
+        "prompt_tokens": 100000000,
+        "completion_tokens": 500000,
+        "total_tokens": 100500000,
+        "last_latency_ms": 1000,
+        "last_tokens_per_second": 5.0,
+        "last_used_at": "2030-01-01T00:00:00+08:00",
+        "last_model": "auto"
+      },
+      "model_costs": [
+        {
+          "model": "auto",
+          "cost_per_1k": 0,
+          "last_seen": "2030-01-01T00:00:00+08:00",
+          "samples": 1
+        },
+        {
+          "model": "glm-5.2",
+          "cost_per_1k": 0,
+          "last_seen": "2030-01-01T00:00:00+08:00",
+          "samples": 2
+        },
+        {
+          "model": "hy4-preview-f",
+          "cost_per_1k": 0,
+          "last_seen": "2030-01-01T00:00:00+08:00",
+          "samples": 5
+        }
+      ],
+      "consecutive_fails": 0,
+      "degrade_until": "0001-01-01T00:00:00Z",
+      "in_flight": 0,
+      "breaker_fails": 0,
+      "breaker_until": "0001-01-01T00:00:00Z"
+    },
+    {
+      "uid": "scrubbed-uid-eeee-ffff-0000-111111111111",
+      "nickname": "scrubbed-nickname-B",
+      "credits": 1500,
+      "credits_total": 2000,
+      "credits_earliest_expiry": "2030-02-01T00:00:00+08:00",
+      "credits_earliest_remaining": 50,
+      "cooling": false,
+      "until": "0001-01-01T00:00:00Z",
+      "rate_limited_models": [
+        {
+          "model": "CN:glm-5.2",
+          "kind": "model_unavailable",
+          "until": "2030-01-01T00:05:00+08:00",
+          "reset_at": "0001-01-01T00:00:00Z",
+          "reason": "11102 model not available"
+        },
+        {
+          "model": "cH:glm-5.2",
+          "kind": "model_unavailable",
+          "until": "2030-01-01T00:05:00+08:00",
+          "reset_at": "0001-01-01T00:00:00Z",
+          "reason": "11102 model not available"
+        }
+      ],
+      "realm": "cn",
+      "disabled": false,
+      "success_count": 2000,
+      "last_success": "2030-01-01T00:00:00+08:00",
+      "last_err": "0001-01-01T00:00:00Z",
+      "token_usage": {
+        "request_count": 2000,
+        "usage_count": 1900,
+        "prompt_tokens": 200000000,
+        "completion_tokens": 800000,
+        "total_tokens": 200800000,
+        "last_latency_ms": 300,
+        "last_used_at": "2030-01-01T00:00:00+08:00",
+        "last_model": "CN:glm-5.2"
+      },
+      "consecutive_fails": 0,
+      "degrade_until": "0001-01-01T00:00:00Z",
+      "in_flight": 0,
+      "breaker_fails": 0,
+      "breaker_until": "0001-01-01T00:00:00Z"
+    }
+  ],
+  "cooling": 0,
+  "cost_explore": {
+    "events_total": 0,
+    "per_model": {}
+  },
+  "credit_floor": 100,
+  "disabled": 0,
+  "healthy": 2,
+  "in_flight_full": 0,
+  "model_locks": [
+    {
+      "model": "CN:glm-5.2",
+      "realm": "cn",
+      "total": 2,
+      "servable": 0,
+      "locked": 2,
+      "state": "locked",
+      "unlock_at": "2030-01-01T00:05:00+08:00",
+      "fully_unlock_at": "2030-01-01T00:05:01+08:00",
+      "reason": "11102 model not available"
+    },
+    {
+      "model": "cH:glm-5.2",
+      "realm": "cn",
+      "total": 2,
+      "servable": 0,
+      "locked": 2,
+      "state": "locked",
+      "unlock_at": "2030-01-01T00:05:00+08:00",
+      "fully_unlock_at": "2030-01-01T00:05:01+08:00",
+      "reason": "11102 model not available"
+    }
+  ],
+  "realm_totals": {
+    "cn": {
+      "cooling": 0,
+      "disabled": 0,
+      "healthy": 2,
+      "in_flight_full": 0,
+      "total": 2
+    },
+    "global": {
+      "cooling": 0,
+      "disabled": 0,
+      "healthy": 0,
+      "in_flight_full": 0,
+      "total": 0
+    }
+  },
+  "redis_mode": "noop",
+  "sticky_sessions": 1,
+  "total": 2
+}
