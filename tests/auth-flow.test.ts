@@ -18,7 +18,7 @@ function makeFetch(opts: {
   pollResponses: Array<{ status: number; body: unknown }>
 }): typeof fetch {
   let pollIndex = 0
-  return (async (input: RequestInfo | URL) => {
+  return (async (input: Parameters<typeof fetch>[0]) => {
     const u = new URL(typeof input === 'string' ? input : input.toString())
     if (u.pathname === '/panel/api/login/start') {
       return jsonResponse(opts.startResponse.status, opts.startResponse.body)

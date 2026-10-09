@@ -102,12 +102,24 @@ export interface ParsedModelId {
  *
  * - `glm-5.2` → wireId=glm-5.2, realm=null, ok=true
  * - `cn:glm-5.2` → wireId=glm-5.2, realm=cn, ok=true
- * - `global:glm-5.2` → wireId=glm-5.2, realm=global, ok=true
+ * - `global:glm-5.2` → **ok=false, rejected**
  * - `cH:glm-5.2` / `CN:glm-5.2` / `GLOBAL:glm-5.2` → ok=false
  * - `openai:gpt-5` (any other prefix) → ok=false
  *
  * Bare ids default to CN because the user's wb2api has zero global
  * accounts (M06 evidence: `realm_totals.global.total = 0`).
+ *
+ * ## Why `global:` is rejected rather than stripped
+ *
+ * An earlier revision accepted `global:glm-5.2` and returned
+ * `wireId=glm-5.2`. That is worse than rejecting it: wb2api routes a bare id
+ * to CN, so a user who explicitly asked for the global realm would silently
+ * get CN — the request succeeds and the answer comes from the wrong realm.
+ * A model that cannot be served must fail loudly.
+ *
+ * v0.2 has no realm routing at all (the adapter sends no realm signal; wb2api
+ * decides from the id). Until it does, `global:` is refused at every entry
+ * point: here, in `listModels`, and in `resolveModel`.
  */
 export function parseModelId(id: string): ParsedModelId {
   if (id.length === 0) {
@@ -128,8 +140,24 @@ export function parseModelId(id: string): ParsedModelId {
   if (id.startsWith('cn:')) {
     return { wireId: id.slice(3), realm: 'cn', hasRealmPrefix: true, ok: true }
   }
+  // Rejected, not stripped. `wireId` is left as the caller wrote it so a
+  // log or error message shows what was actually asked for.
   if (id.startsWith('global:')) {
-    return { wireId: id.slice(7), realm: 'global', hasRealmPrefix: true, ok: true }
+    return {
+      wireId: id,
+      realm: 'global',
+      hasRealmPrefix: true,
+      ok: false,
+      rejection: {
+        code: 'PROVIDER_REJECTED_GLOBAL',
+        message:
+          `workbuddy: model id "${id}" asks for the global realm, which this ` +
+          `plugin does not route yet. This gateway has no global accounts ` +
+          `(M06 evidence: realm_totals.global.total = 0), and wb2api routes a ` +
+          `bare id to CN - so stripping the prefix would silently answer from ` +
+          `the wrong realm. Use the CN id instead, e.g. "cn:${id.slice(7)}".`,
+      },
+    }
   }
   // Fall-through: any other prefix is rejected. The original
   // upstream wb2api would have passed the entire string through
@@ -282,7 +310,11 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
     const out: WorkbuddyModelView[] = []
     for (const entry of response.data) {
       const parsed = parseModelId(entry.id)
-      if (!parsed.ok) continue
+      // Entry-point 1 of 3 for the global block. `parseModelId` rejects
+      // `global:` so this also covers the upstream ever advertising one; the
+      // explicit realm test keeps a model the user cannot call out of the
+      // picker even if the parser's rules change later.
+      if (!parsed.ok || parsed.realm === 'global') continue
       out.push({
         provider: WORKBUDDY_PROVIDER,
         // DSH shows this id in the Models page; strip the prefix
@@ -308,9 +340,15 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
         'PROVIDER_MISMATCH',
       )
     }
+    // Entry-point 2 of 3 for the global block: `parseModelId` refuses
+    // `global:` outright, so this throws PROVIDER_REJECTED_GLOBAL.
     const parsed = parseModelId(model)
-    if (!parsed.ok) {
-      throw new WorkbuddyLlmError(parsed.rejection!.message, parsed.rejection!.code)
+    if (!parsed.ok || parsed.realm === 'global') {
+      const rejection = parsed.rejection ?? {
+        code: 'PROVIDER_REJECTED_GLOBAL',
+        message: `workbuddy: the global realm is not routable in v0.2 (model "${model}")`,
+      }
+      throw new WorkbuddyLlmError(rejection.message, rejection.code)
     }
     return {
       provider: WORKBUDDY_PROVIDER,
@@ -318,6 +356,14 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
       name: parsed.wireId,
       hasRealmPrefix: parsed.hasRealmPrefix,
       realm: parsed.realm,
+      // Load-bearing, not decorative. `LlmRuntime.stream()` projects image
+      // blocks into text placeholders only when `inputModalities` is declared
+      // and omits `image` ("absent means unknown, while an explicit omission
+      // is negative capability"). This adapter serializes text only and cannot
+      // resolve an `ImageAttachmentRef` to bytes, so declaring text-only is
+      // both honest and what makes the runtime hand it pre-projected content
+      // instead of raw image blocks it would have to drop.
+      inputModalities: ['text'],
     } as LlmResolvedModelInfo
   }
 
@@ -350,9 +396,18 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
       throw new WorkbuddyLlmError('workbuddy: stream cancelled before start', 'CALL_CANCELLED')
     }
 
+    // Entry-point 3 of 3 for the global block. All three are guarded
+    // separately on purpose: `listModels` keeps the model out of the picker,
+    // `resolveModel` rejects it before the call is prepared, and this one
+    // rejects it even if a caller reaches `stream` directly with a
+    // hand-built `GenerateOptions` - which the runtime permits.
     const parsed = parseModelId(options.model)
-    if (!parsed.ok) {
-      throw new WorkbuddyLlmError(parsed.rejection!.message, parsed.rejection!.code)
+    if (!parsed.ok || parsed.realm === 'global') {
+      const rejection = parsed.rejection ?? {
+        code: 'PROVIDER_REJECTED_GLOBAL',
+        message: `workbuddy: the global realm is not routable in v0.2 (model "${options.model}")`,
+      }
+      throw new WorkbuddyLlmError(rejection.message, rejection.code)
     }
 
     // Translate GenerateOptions to OpenAI Chat Completions wire body.
@@ -393,34 +448,91 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
 
 // ---------------------------------------------------------------------------
 // Map GenerateOptions -> OpenAI Chat Completions body.
+//
+// Every DSH message carries `content: readonly ContentBlock[]` - never a
+// string. Translating that to the wire is not a pass-through, because the two
+// sides disagree on three things:
+//
+//   - The provider correlates a tool result with its call through
+//     `tool_call_id` (on the tool-role message) and `tool_calls` (on the
+//     assistant message that requested it). DSH carries the same correlation
+//     in `ToolResultMessage.toolCallId` and in `tool-call` content blocks.
+//     Drop either and the provider cannot match the result to the call.
+//   - `reasoning` blocks are model scratchpad, not conversation. They are
+//     returned to no provider.
+//   - `tool-addition` / `tool-removal` blocks are session bookkeeping. The
+//     runtime's `projectToolUpdates` has already turned them into the `tools`
+//     argument, so they are not sent as message content.
+//
+// Content that the runtime projects before dispatch: file blocks become
+// handle text for every route, and image blocks become placeholders for routes
+// whose `inputModalities` omits `image`. This adapter declares text-only input
+// (see `resolveModel`), so by the time `stream()` runs both are already text.
+// The image/file branches below are a defensive fallback for a block that
+// survives projection: rendering a neutral placeholder loses less than
+// dropping the block silently.
+
+/** OpenAI tool declaration as sent on the wire. */
+interface WireTool {
+  type: 'function'
+  function: { name: string; description: string; parameters: Record<string, unknown> }
+}
+
+/** OpenAI tool call on an assistant message. */
+interface WireToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
+/**
+ * One message on the wire. `content` is `null` only for an assistant turn that
+ * carries tool calls and no text, which is the shape the provider expects.
+ */
+interface WireMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string | null
+  tool_calls?: WireToolCall[]
+  tool_call_id?: string
+}
 
 interface ChatCompletionsBody {
   model: string
-  messages: Array<{ role: string; content: string | null; name?: string }>
+  messages: WireMessage[]
   stream: true
   temperature?: number
   max_tokens?: number
   stop?: string[]
-  tools?: Array<{
-    type: 'function'
-    function: { name: string; description: string; parameters: Record<string, unknown> }
-  }>
+  tools?: WireTool[]
   tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } }
   reasoning_effort?: string
 }
 
+/** Separator for consecutive text blocks inside one message. */
+const TEXT_BLOCK_JOINER = '\n\n'
+
+/** Placeholder for an image block that reached the adapter unprojected. */
+const UNPROJECTED_IMAGE_TEXT = '[image omitted: this route accepts text only]'
+
+/** Placeholder for a file block that reached the adapter unprojected. */
+const UNPROJECTED_FILE_TEXT = '[file omitted: this route receives file handles as text]'
+
 function buildChatCompletionsBody(wireId: string, opts: GenerateOptions): ChatCompletionsBody {
-  const body: ChatCompletionsBody = {
-    model: wireId,
-    stream: true,
-    messages: opts.messages.map((m) => ({
-      role: m.role,
-      content: extractMessageContent(m.content),
-      ...(m.role === 'tool' && (m as unknown as { name?: string }).name !== undefined
-        ? { name: (m as unknown as { name?: string }).name }
-        : {}),
-    })),
+  const messages: WireMessage[] = []
+
+  // A one-shot caller's system prompt is mapped to the provider's system slot
+  // ahead of the conversation; loop-built requests carry it as the leading
+  // system message instead and leave `system` undefined.
+  if (opts.system !== undefined && opts.system.length > 0) {
+    messages.push({ role: 'system', content: opts.system })
   }
+
+  for (const message of opts.messages) {
+    const wire = toWireMessage(message)
+    if (wire !== null) messages.push(wire)
+  }
+
+  const body: ChatCompletionsBody = { model: wireId, stream: true, messages }
   if (opts.temperature !== undefined) body.temperature = opts.temperature
   if (opts.maxTokens !== undefined) body.max_tokens = opts.maxTokens
   if (opts.stop !== undefined && opts.stop.length > 0) body.stop = opts.stop
@@ -434,17 +546,90 @@ function buildChatCompletionsBody(wireId: string, opts: GenerateOptions): ChatCo
   return body
 }
 
-function extractMessageContent(
-  content: unknown,
-): string | null {
-  // GenerateOptions messages carry a typed `content`; in v0.2 the
-  // base type from dsh-llm is `RequestMessage['content']` (either a
-  // string or a structured block array). The OpenAI wire format
-  // accepts both shapes, so we pass the value through unchanged.
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) return JSON.stringify(content)
-  if (content === null || content === undefined) return null
-  return JSON.stringify(content)
+/** Convert one DSH message, or `null` when it carries nothing the model sees. */
+function toWireMessage(message: GenerateOptions['messages'][number]): WireMessage | null {
+  const blocks = message.content
+
+  if (message.role === 'assistant') {
+    const text = textOf(blocks)
+    const toolCalls = toolCallsOf(blocks)
+    if (text.length === 0 && toolCalls.length === 0) return null
+    return {
+      role: 'assistant',
+      // An assistant turn that only requests tools sends `content: null`.
+      content: text.length > 0 ? text : null,
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+    }
+  }
+
+  if (message.role === 'tool') {
+    // `toolCallId` is what lets the provider pair this result with the
+    // assistant turn that asked for it. Without it the provider sees an
+    // orphan tool message and rejects or ignores the result.
+    return {
+      role: 'tool',
+      tool_call_id: String(message.toolCallId),
+      content: textOf(blocks),
+    }
+  }
+
+  const text = textOf(blocks)
+  // `developer` messages carry tool add/remove bookkeeping, which
+  // `projectToolUpdates` has already folded into the `tools` argument. Any
+  // remaining prose is advice about how to behave, so it travels in the
+  // system slot; a developer message with no prose at all is dropped.
+  if (message.role === 'developer') {
+    return text.length > 0 ? { role: 'system', content: text } : null
+  }
+  if (message.role === 'system') {
+    return { role: 'system', content: text }
+  }
+  return { role: 'user', content: text }
+}
+
+/**
+ * Flatten a message's model-visible text.
+ *
+ * Drops `reasoning` (scratchpad, not conversation), `tool-call` (carried
+ * separately as `tool_calls`), and `tool-addition` / `tool-removal`
+ * (bookkeeping already folded into the tool declarations).
+ */
+function textOf(blocks: readonly ContentBlock[]): string {
+  const parts: string[] = []
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'text':
+        parts.push((block as { text: string }).text)
+        break
+      case 'image':
+        parts.push(UNPROJECTED_IMAGE_TEXT)
+        break
+      case 'file':
+        parts.push(UNPROJECTED_FILE_TEXT)
+        break
+      default:
+        // `reasoning`, `tool-call`, `tool-addition`, `tool-removal`, and any
+        // block type a future DSH version adds.
+        break
+    }
+  }
+  return parts.filter((p) => p.length > 0).join(TEXT_BLOCK_JOINER)
+}
+
+/** The `tool_calls` array for an assistant turn, in block order. */
+function toolCallsOf(blocks: readonly ContentBlock[]): WireToolCall[] {
+  const calls: WireToolCall[] = []
+  for (const block of blocks) {
+    if (block.type !== 'tool-call') continue
+    const call = block as { id: string; name: string; arguments: string }
+    calls.push({
+      id: String(call.id),
+      type: 'function',
+      // Already a raw JSON string, which is what the wire wants.
+      function: { name: call.name, arguments: call.arguments },
+    })
+  }
+  return calls
 }
 
 // ---------------------------------------------------------------------------
@@ -535,11 +720,31 @@ class StreamTranslator {
   private reasoning: OpenTextBlock | null = null
   /** Keyed by the upstream `tool_calls[].index` (absent means 0). */
   private readonly toolCalls = new Map<number, OpenToolCall>()
+  /**
+   * The reason from the frame that carried `finish_reason`, held back until
+   * the stream ends.
+   *
+   * The contract is "adapters emit usage before the terminal finish and
+   * nothing afterward", and OpenAI-shaped streams violate that if the adapter
+   * passes the finish through immediately: with `stream_options.include_usage`
+   * the usage arrives in a *separate frame after* the one carrying
+   * `finish_reason`. Emitting `finish` on sight would put usage after the
+   * terminal chunk. Deferring it means the finish is emitted once, last, by
+   * `terminalChunks()` - by which point any trailing usage frame has already
+   * produced its `usage` chunk.
+   */
+  private pendingFinish: FinishReason | null = null
+  /** Whether `terminalChunks()` has already run. */
   private finished = false
 
   /** Whether a terminal `finish` chunk has already been emitted. */
   get hasFinished(): boolean {
     return this.finished
+  }
+
+  /** Whether the upstream reported a `finish_reason`. */
+  get sawFinishReason(): boolean {
+    return this.pendingFinish !== null
   }
 
   /** Translate one upstream chat.completion.chunk into zero or more chunks. */
@@ -554,17 +759,37 @@ class StreamTranslator {
         this.appendText(delta.content, out)
         this.appendReasoning(delta.reasoning_content, out)
       }
-      if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
+      if (
+        choice.finish_reason !== null &&
+        choice.finish_reason !== undefined &&
+        this.pendingFinish === null
+      ) {
+        // Close the open blocks now: their `block-end` chunks are not
+        // terminal, so they may precede usage without breaking the contract.
         out.push(...this.closeAll())
-        out.push({ type: 'finish', reason: mapFinishReason(choice.finish_reason) })
-        this.finished = true
+        this.pendingFinish = mapFinishReason(choice.finish_reason)
       }
     }
 
+    // Before the finish, always - whatever order the frames arrived in.
     if (upstream.usage !== undefined) {
       out.push({ type: 'usage', usage: usageFromUpstream(upstream.usage) })
     }
     return out
+  }
+
+  /**
+   * The chunks that end the stream: any still-open blocks, then exactly one
+   * terminal `finish`. Empty once the terminal chunk has been emitted, so a
+   * caller cannot emit two.
+   *
+   * @param fallback - reason to report when the upstream never sent one,
+   *   which is the normal case for `[DONE]` without a `finish_reason` frame.
+   */
+  terminalChunks(fallback: FinishReason = { kind: 'stop' }): StreamChunk[] {
+    if (this.finished) return []
+    this.finished = true
+    return [...this.closeAll(), { type: 'finish', reason: this.pendingFinish ?? fallback }]
   }
 
   /**
@@ -746,7 +971,17 @@ async function* parseSseStream(
         )
       }
       if (streamDone) break
-      if (chunkValue !== undefined) buffer += decoder.decode(chunkValue, { stream: true })
+      if (chunkValue !== undefined) {
+        // Normalize CRLF as the buffer grows. SSE frames may be terminated by
+        // `\n\n` or `\r\n\r\n`, and the two are not interchangeable to
+        // `indexOf('\n\n')` - a CRLF stream would never split into events and
+        // the whole response would arrive as one unsplittable blob. Doing the
+        // replace after concatenating (rather than per chunk) also handles a
+        // `\r\n` straddling a chunk boundary: the `\r` sits at the tail of one
+        // buffer and the `\n` at the head of the next, and the pair is
+        // normalized on the following pass.
+        buffer = (buffer + decoder.decode(chunkValue, { stream: true })).replace(/\r\n/g, '\n')
+      }
 
       let boundary = buffer.indexOf('\n\n')
       while (boundary !== -1) {
@@ -757,10 +992,7 @@ async function* parseSseStream(
           if (!line.startsWith('data:')) continue
           const data = line.slice(5).trim()
           if (data === '[DONE]') {
-            if (!translator.hasFinished) {
-              for (const chunk of translator.closeAll()) yield chunk
-              yield { type: 'finish', reason: { kind: 'stop' } }
-            }
+            for (const chunk of translator.terminalChunks()) yield chunk
             return
           }
           let parsed: UpstreamChunk
@@ -777,11 +1009,24 @@ async function* parseSseStream(
       }
     }
 
-    // The body ended without `[DONE]`. Close whatever is open so the
-    // assembler is not left with a dangling partial.
+    // The body ended without `[DONE]`. Whether that is a normal end depends
+    // on whether the upstream ever reported a `finish_reason`:
+    //
+    //   - It did. Some deployments close the connection after the final frame
+    //     instead of writing `[DONE]`. The turn is complete; finish normally.
+    //   - It did not. The connection dropped mid-turn. Reporting `stop` here
+    //     would hand the agent a truncated answer that looks complete, so fail
+    //     instead and let `LlmRuntime.stream()` normalize it to a terminal
+    //     error the loop can act on.
     if (!translator.hasFinished) {
-      for (const chunk of translator.closeAll()) yield chunk
-      yield { type: 'finish', reason: { kind: 'stop' } }
+      if (!translator.sawFinishReason) {
+        throw new WorkbuddyLlmError(
+          'workbuddy: upstream closed the stream before reporting finish_reason ' +
+            '(response is truncated, not complete)',
+          'STREAM_TRUNCATED',
+        )
+      }
+      for (const chunk of translator.terminalChunks()) yield chunk
     }
   } finally {
     try {

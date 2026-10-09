@@ -98,7 +98,7 @@ function makeAdapter(
   frames: readonly Frame[],
   captured: WireCapture[] = [],
 ): { adapter: WorkbuddyLlmAdapter; captured: WireCapture[] } {
-  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const path = new URL(typeof input === 'string' ? input : input.toString()).pathname
     if (path === '/v1/models') {
       return new Response(JSON.stringify({ object: 'list', data: [] }), {
@@ -141,6 +141,21 @@ const WEATHER_TOOL: ToolSchema = {
   },
 }
 
+/**
+ * Build a user-role message the way the runtime demands.
+ *
+ * `NewUserMessage` requires `source`. An earlier revision of this file called
+ * `createUserMessage({ content })` without it, which type-checked only because
+ * the tests were excluded from `tsc`; running them through the compiler is
+ * what surfaced it.
+ */
+function userMessage(text: string) {
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  })
+}
+
 // ---------------------------------------------------------------------------
 
 describe('simulated E2E — text turn', () => {
@@ -156,7 +171,7 @@ describe('simulated E2E — text turn', () => {
     const assembler = await runOnce(adapter, {
       provider: WORKBUDDY_PROVIDER,
       model: 'glm-5.2',
-      messages: [createUserMessage({ content: [{ type: 'text', text: 'What is the answer?' }] })],
+      messages: [userMessage('What is the answer?')],
     })
 
     const blocks = assembler.blocks()
@@ -185,7 +200,7 @@ describe('simulated E2E — tool-call turn (the Agent path)', () => {
     const assembler = await runOnce(adapter, {
       provider: WORKBUDDY_PROVIDER,
       model: 'glm-5.2',
-      messages: [createUserMessage({ content: [{ type: 'text', text: 'Weather in Beijing?' }] })],
+      messages: [userMessage('Weather in Beijing?')],
       tools: [WEATHER_TOOL],
     })
 
@@ -264,14 +279,12 @@ describe('simulated E2E — full agent round trip', () => {
       { finish: 'tool_calls' },
     ]
     const turn1 = makeAdapter(turn1Frames)
-    const userMessage = createUserMessage({
-      content: [{ type: 'text', text: 'Weather in Beijing?' }],
-    })
+    const firstUserMessage = userMessage('Weather in Beijing?')
 
     const firstAssembler = await runOnce(turn1.adapter, {
       provider: WORKBUDDY_PROVIDER,
       model: 'glm-5.2',
-      messages: [userMessage],
+      messages: [firstUserMessage],
       tools: [WEATHER_TOOL],
     })
     const call = firstAssembler.blocks()[0] as { type: 'tool-call'; id: string }
@@ -286,6 +299,8 @@ describe('simulated E2E — full agent round trip', () => {
     const toolResult = createToolResultMessage({
       callId: call.id as never,
       content: [{ type: 'text', text: 'Beijing: 22C, clear' }],
+      // Required by `ToolResultMessageInput`. An earlier revision omitted it.
+      isError: false,
     })
 
     // Turn 2: the model answers using the tool result.
@@ -297,7 +312,7 @@ describe('simulated E2E — full agent round trip', () => {
     const secondAssembler = await runOnce(turn2.adapter, {
       provider: WORKBUDDY_PROVIDER,
       model: 'glm-5.2',
-      messages: [userMessage, assistantMessage, toolResult],
+      messages: [firstUserMessage, assistantMessage, toolResult],
       tools: [WEATHER_TOOL],
     })
 
@@ -362,7 +377,7 @@ describe('simulated E2E — interruption', () => {
 
     const ac = new AbortController()
     const assembler = new BlockAssembler()
-    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const path = new URL(typeof input === 'string' ? input : input.toString()).pathname
       if (path === '/v1/models') {
         return new Response(JSON.stringify({ object: 'list', data: [] }), { status: 200 })

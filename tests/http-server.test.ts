@@ -15,7 +15,7 @@ import { WorkbuddyClient } from '../src/host/workbuddy-client.js'
 function makeStubFetch(upstream: {
   bodies: Record<string, { status: number; body: unknown }>
 }): typeof fetch {
-  return (async (input: RequestInfo | URL) => {
+  return (async (input: Parameters<typeof fetch>[0]) => {
     const url = typeof input === 'string' ? input : input.toString()
     const u = new URL(url)
     const match = upstream.bodies[u.pathname]

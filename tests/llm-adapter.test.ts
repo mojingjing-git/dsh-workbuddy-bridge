@@ -67,10 +67,19 @@ function makeFetch(opts: {
   frames?: SseFrame[]
   /** HTTP status to return for /v1/chat/completions. */
   completionStatus?: number
+  /**
+   * Frame terminator. SSE permits `\n\n` and `\r\n\r\n`; the parser must not
+   * depend on which one the deployment happens to emit.
+   */
+  terminator?: '\n\n' | '\r\n\r\n'
+  /** Omit the trailing `data: [DONE]` frame. */
+  omitDone?: boolean
+  /** Replace the generated body entirely, for byte-level edge cases. */
+  rawBody?: string
   /** Capture the request body for assertions. */
   capture?: (path: string, body: unknown) => void
 }): typeof fetch {
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString()
     const path = new URL(url).pathname
     if (path === '/v1/models') {
@@ -89,12 +98,19 @@ function makeFetch(opts: {
       if (status !== 200) {
         return new Response('upstream error', { status })
       }
-      const lines: string[] = []
-      for (const f of opts.frames ?? []) {
-        lines.push(`data: ${frameToJson(f)}\n\n`)
+      let text: string
+      if (opts.rawBody !== undefined) {
+        text = opts.rawBody
+      } else {
+        const terminator = opts.terminator ?? '\n\n'
+        const lines: string[] = []
+        for (const f of opts.frames ?? []) {
+          lines.push(`data: ${frameToJson(f)}${terminator}`)
+        }
+        if (opts.omitDone !== true) lines.push(`data: [DONE]${terminator}`)
+        text = lines.join('')
       }
-      lines.push('data: [DONE]\n\n')
-      return new Response(new TextEncoder().encode(lines.join('')), {
+      return new Response(new TextEncoder().encode(text), {
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
       })
@@ -107,6 +123,9 @@ function makeAdapter(opts: {
   models?: string[]
   frames?: SseFrame[]
   completionStatus?: number
+  terminator?: '\n\n' | '\r\n\r\n'
+  omitDone?: boolean
+  rawBody?: string
   capture?: (path: string, body: unknown) => void
 }): WorkbuddyLlmAdapter {
   const fetchImpl = makeFetch(opts)
@@ -153,12 +172,23 @@ describe('parseModelId', () => {
     expect(r.hasRealmPrefix).toBe(true)
   })
 
-  it('strips an exact lowercase global: prefix', () => {
+  it('rejects an exact lowercase global: prefix instead of stripping it', () => {
+    // v0.2 refuses the global realm at every entry point. Stripping the prefix
+    // and sending the bare id would be worse than refusing: wb2api routes a
+    // bare id to CN, so the request would succeed and answer from the wrong
+    // realm. This gateway has no global accounts
+    // (M06: realm_totals.global.total = 0), and this adapter sends no realm
+    // signal of its own.
     const r = parseModelId('global:gpt-5')
-    expect(r.ok).toBe(true)
-    expect(r.wireId).toBe('gpt-5')
+    expect(r.ok).toBe(false)
+    expect(r.rejection?.code).toBe('PROVIDER_REJECTED_GLOBAL')
+    // `wireId` keeps what the caller wrote, so an error or log shows the
+    // request as made rather than a mutated form.
+    expect(r.wireId).toBe('global:gpt-5')
     expect(r.realm).toBe('global')
     expect(r.hasRealmPrefix).toBe(true)
+    // The message must name a workable alternative.
+    expect(r.rejection?.message).toContain('cn:gpt-5')
   })
 
   it('rejects mixed-case cH: (M05 evidence: upstream 400 / 11102)', () => {
@@ -203,9 +233,9 @@ describe('parseModelId', () => {
 
 describe('WorkbuddyLlmAdapter.listModels', () => {
   it('strips the cn: prefix so the DSH model directory shows bare ids', async () => {
-    const adapter = makeAdapter({ models: ['cn:glm-5.2', 'cn:auto', 'global:foo'] })
+    const adapter = makeAdapter({ models: ['cn:glm-5.2', 'cn:auto'] })
     const models = await adapter.listModels(WORKBUDDY_PROVIDER)
-    expect(models.length).toBe(3)
+    expect(models.length).toBe(2)
     // This is the load-bearing assertion: v0.1 registered `cn:glm-5.2`.
     expect(models[0]).toEqual({
       provider: 'workbuddy',
@@ -215,8 +245,16 @@ describe('WorkbuddyLlmAdapter.listModels', () => {
       realm: 'cn',
     })
     expect(models[1]?.id).toBe('auto')
-    expect(models[2]?.id).toBe('foo')
-    expect(models[2]?.realm).toBe('global')
+  })
+
+  it('keeps global-realm models out of the directory entirely', async () => {
+    // Entry-point 1 of the 3-way global block. A model the user cannot call
+    // must not appear in the picker, or selecting it produces an error the
+    // user cannot act on.
+    const adapter = makeAdapter({ models: ['cn:glm-5.2', 'global:foo', 'cn:auto'] })
+    const models = await adapter.listModels(WORKBUDDY_PROVIDER)
+    expect(models.map((m) => m.id)).toEqual(['glm-5.2', 'auto'])
+    expect(models.some((m) => m.realm === 'global')).toBe(false)
   })
 
   it('never leaks a cn: prefix into any returned id', async () => {
@@ -236,7 +274,7 @@ describe('WorkbuddyLlmAdapter.listModels', () => {
 
   it('caches the list within the TTL', async () => {
     let calls = 0
-    const fetchImpl = (async (input: RequestInfo | URL) => {
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0]) => {
       const path = new URL(typeof input === 'string' ? input : input.toString()).pathname
       if (path === '/v1/models') {
         calls += 1
@@ -516,5 +554,138 @@ describe('WorkbuddyLlmAdapter.stream', () => {
     expect(body.tools?.length).toBe(1)
     expect(body.tools?.[0]?.type).toBe('function')
     expect(body.tools?.[0]?.function.name).toBe('t')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SSE framing and chunk ordering.
+//
+// Three defects the review named, all invisible to a test that only checks the
+// assembled message:
+//
+//   1. Usage emitted after the terminal finish when both arrived in one frame.
+//      The contract is "adapters emit usage before the terminal finish and
+//      nothing afterward".
+//   2. `\n\n` only. A deployment framing events with `\r\n\r\n` would never
+//      split, so the whole response arrived as one unsplittable blob.
+//   3. A connection that closed without `[DONE]` was reported as a normal
+//      `stop` even when no `finish_reason` had arrived - handing the agent a
+//      truncated answer indistinguishable from a complete one.
+
+describe('SSE — usage precedes the terminal finish', () => {
+  it('orders usage before finish when one frame carries both', async () => {
+    const adapter = makeAdapter({
+      rawBody:
+        'data: ' +
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }) +
+        '\n\ndata: ' +
+        JSON.stringify({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+        }) +
+        '\n\ndata: [DONE]\n\n',
+    })
+    const chunks = await drain(adapter)
+    const types = chunks.map((c) => (c as { type: string }).type)
+    expect(types).toEqual(['block-start', 'text-delta', 'block-end', 'usage', 'finish'])
+    expect(types.indexOf('usage')).toBeLessThan(types.indexOf('finish'))
+  })
+
+  it('orders usage before finish when usage trails the finish frame', async () => {
+    // The shape OpenAI emits with `stream_options.include_usage`: the usage
+    // frame comes *after* the frame carrying finish_reason. Emitting the
+    // finish on sight would put usage after the terminal chunk.
+    const adapter = makeAdapter({
+      frames: [
+        { kind: 'text', text: 'hi' },
+        { kind: 'finish', reason: 'stop' },
+        { kind: 'usage', prompt: 5, completion: 2, total: 7 },
+      ],
+    })
+    const chunks = await drain(adapter)
+    const types = chunks.map((c) => (c as { type: string }).type)
+    expect(types.filter((t) => t === 'finish').length).toBe(1)
+    expect(types.indexOf('usage')).toBeLessThan(types.indexOf('finish'))
+    expect(types[types.length - 1]).toBe('finish')
+  })
+
+  it('emits exactly one finish even when the upstream sends two reasons', async () => {
+    const adapter = makeAdapter({
+      frames: [
+        { kind: 'text', text: 'hi' },
+        { kind: 'finish', reason: 'stop' },
+        { kind: 'finish', reason: 'stop' },
+      ],
+    })
+    const chunks = await drain(adapter)
+    expect(chunks.filter((c) => (c as { type: string }).type === 'finish').length).toBe(1)
+  })
+})
+
+describe('SSE — CRLF framing', () => {
+  it('parses a body framed with CRLF', async () => {
+    const adapter = makeAdapter({
+      terminator: '\r\n\r\n',
+      frames: [
+        { kind: 'text', text: 'alpha' },
+        { kind: 'finish', reason: 'stop' },
+      ],
+    })
+    const chunks = await drain(adapter)
+    const text = chunks
+      .filter((c) => (c as { type: string }).type === 'text-delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    expect(text).toBe('alpha')
+    expect(chunks.some((c) => (c as { type: string }).type === 'finish')).toBe(true)
+  })
+
+  it('parses a CRLF body that also carries usage', async () => {
+    const adapter = makeAdapter({
+      terminator: '\r\n\r\n',
+      frames: [
+        { kind: 'text', text: 'x' },
+        { kind: 'finish', reason: 'stop' },
+        { kind: 'usage', prompt: 3, completion: 1 },
+      ],
+    })
+    const chunks = await drain(adapter)
+    const types = chunks.map((c) => (c as { type: string }).type)
+    expect(types).toContain('usage')
+    expect(types[types.length - 1]).toBe('finish')
+  })
+})
+
+describe('SSE — a body that ends early is not a normal completion', () => {
+  it('fails when the body ends with no finish_reason and no [DONE]', async () => {
+    // A dropped connection mid-turn. Reporting `stop` here would hand the
+    // agent a truncated answer that looks complete.
+    const adapter = makeAdapter({
+      omitDone: true,
+      frames: [{ kind: 'text', text: 'partial answer' }],
+    })
+    let caught: unknown
+    try {
+      await drain(adapter)
+    } catch (e) {
+      caught = e
+    }
+    expect(String((caught as { code?: string }).code)).toBe('STREAM_TRUNCATED')
+  })
+
+  it('completes normally when the body ends without [DONE] but did report a reason', async () => {
+    // Some deployments close the connection after the last frame instead of
+    // writing `[DONE]`. The turn is complete; that must not be an error.
+    const adapter = makeAdapter({
+      omitDone: true,
+      frames: [
+        { kind: 'text', text: 'complete answer' },
+        { kind: 'finish', reason: 'stop' },
+      ],
+    })
+    const chunks = await drain(adapter)
+    const last = chunks[chunks.length - 1] as { type: string; reason: unknown }
+    expect(last.type).toBe('finish')
+    expect(last.reason).toEqual({ kind: 'stop' })
   })
 })
