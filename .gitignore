@@ -1,0 +1,44 @@
+# Node
+node_modules/
+.pnp.*
+.yarn/cache
+.yarn/install-state.gz
+*.log
+
+# Build / cache (P0+)
+dist/
+build/
+.cache/
+.turbo/
+coverage/
+
+# DSH runtime
+.DSH_HOME/
+.staging/
+*.pid
+*.sock
+
+# Go toolchain / wb2api (Managed mode P2+)
+bin/
+vendor/wb2api-source/.gitsha
+$DSH_HOME/workbuddy-bridge/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Secrets / runtime
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+.auths/
+data/
+runtime/
+backups/
