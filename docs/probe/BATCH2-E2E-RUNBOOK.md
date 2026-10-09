@@ -1,8 +1,12 @@
 # Batch 2 验收 — 真机 DSH Desktop E2E runbook
 
 > 日期：2026-10-10
-> 对应 commit：`REDACTED-SHA` (fix(llm): rewrite adapter against official DSH types)
 > 验收门槛：**DSH Agent 真实完成一次 tool call → 执行 → 结果回填 → 最终回答**
+>
+> **重要前置发现**：用户 desktop profile 的 `cordis.patch.yml` 里已经有一条手工
+> 配置的 `dsh-llm-pi-ai` 路由（provider 名 `abc123`）指向同一个 wb2api 网关，
+> 且网关请求日志显示该链路已经正常完成过工具调用与结果回填。因此下面这些步骤
+> 既可以用来验收**本插件**，也可以用来对照那条手工配置的差异。
 
 ## 前置条件（已满足的部分）
 
