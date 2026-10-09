@@ -28,6 +28,15 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+// Type-only imports from the DSH LLM seam. The runtime instance of
+// the `llm` service is provided by the DSH desktop bundle via
+// `ctx.get('llm')`; the plugin never imports this package at runtime
+// (the bundle has its own copy).
+import type {
+  LlmDiscoveredModel,
+  LlmModelDiscoveryRequest,
+  LlmRuntime,
+} from '@deepseek-ai/dsh-llm'
 
 import { Config, type WorkbuddyConfig, type WorkbuddyProviderConfig } from './schema.js'
 import {
@@ -36,7 +45,11 @@ import {
   COST_METER_CREDITS_PATH,
 } from '../shared/constants.js'
 import { WorkbuddyClient } from './workbuddy-client.js'
-import { WorkbuddyLlmAdapter, WORKBUDDY_PROVIDER } from './llm-adapter.js'
+import {
+  WorkbuddyLlmAdapter,
+  WORKBUDDY_PROVIDER,
+  workbuddyConfigurableProvider,
+} from './llm-adapter.js'
 import {
   startManagementServer,
   defaultManagementKey,
@@ -146,6 +159,10 @@ async function mountEverything(
 ): Promise<void> {
   const baseURL = (route.baseURL ?? DEFAULT_WB2API_BASEURL).replace(/\/+$/, '')
   const realm = route.realm
+  // The settings namespace is the plugin's registered name; it is how
+  // the Models page addresses this route's configuration, and it must
+  // be stable across restarts.
+  const settingsNs = PLUGIN_NAME
 
   const client = new WorkbuddyClient({ baseURL, apiKey })
   const managementKey = defaultManagementKey()
@@ -165,62 +182,56 @@ async function mountEverything(
     `workbuddy: management server bound at ${mgmt.baseURL}${COST_METER_CREDITS_PATH}`,
   )
 
-  // 2) LLM adapter (M02 contract).
+  // 2) LLM adapter (M02 contract). The adapter implements the
+  //    official `LlmAdapter` abstract class shape via a type-only
+  //    import; the runtime duck-types it (no instanceof check).
   const adapter = new WorkbuddyLlmAdapter(client)
 
-  // 3) Inject the LLM service and register.
-  const llm = ctx.get('llm') as
-    | {
-        registerAdapter(routes: string[], adapter: unknown): { replace: (next: string[]) => void; (): void }
-        registerConfigurableProviders(entries: readonly unknown[]): { replace: (next: readonly unknown[]) => void; (): void }
-        registerModelDiscovery(
-          settingsNs: string,
-          discover: (req: unknown, signal?: AbortSignal) => Promise<readonly unknown[]>,
-        ): () => void
-      }
-    | undefined
+  // 3) Get the `llm` service and register the route. We use the
+  //    official `LlmRuntime` type so the calls below are checked
+  //    against the shapes the DSH bundle actually provides.
+  const llm = ctx.get('llm') as LlmRuntime | undefined
 
   if (llm === undefined) {
     ctx.logger.error('workbuddy: ctx.get("llm") returned undefined; LLM route not registered')
   } else {
+    // 3a) Register the adapter for the workbuddy route. The runtime
+    //     validates `providerInfo().id === provider` and rejects
+    //     duplicates (M02 evidence, LlmRuntime.prepareRoutes).
     const handle = llm.registerAdapter([WORKBUDDY_PROVIDER], adapter)
     ctx.effect(function* () {
       yield () => handle()
     }, 'workbuddy: llm adapter lifecycle')
 
-    const directoryEntry = {
-      provider: WORKBUDDY_PROVIDER,
-      displayName: 'WorkBuddy / CodeBuddy',
-      settingsNs: 'workbuddy',
-      settingsPath: ['providers', 'workbuddy'],
-    }
-    const dirHandle = llm.registerConfigurableProviders([directoryEntry])
+    // 3b) Declare the provider as configurable so the Models page
+    //     can show and edit it.
+    const dirHandle = llm.registerConfigurableProviders([
+      workbuddyConfigurableProvider(settingsNs),
+    ])
     ctx.effect(function* () {
       yield () => dirHandle()
     }, 'workbuddy: llm directory lifecycle')
 
+    // 3c) Offer endpoint interrogation for the settings namespace.
+    //     The Models page calls this when the user clicks
+    //     "discover models"; we answer from the route's own list.
     const discover = async (
-      request: unknown,
-      signal?: AbortSignal,
-    ): Promise<readonly unknown[]> => {
-      const r = (request ?? {}) as { provider?: string; baseURL?: string }
-      // The Models page passes a draft request — we always serve the workbuddy
-      // route's discovered model list. If the user is interrogating another
-      // baseURL, fall back to the cached list.
-      if (r.provider !== undefined && r.provider !== WORKBUDDY_PROVIDER) return []
+      request: LlmModelDiscoveryRequest,
+      _signal?: AbortSignal,
+    ): Promise<readonly LlmDiscoveredModel[]> => {
+      // A draft editing another route is not ours to answer.
+      if (request.provider !== undefined && request.provider !== WORKBUDDY_PROVIDER) return []
       const list = await adapter.listModels(WORKBUDDY_PROVIDER)
-      return list.map((m) => ({
-        id: m.id,
-        name: m.name,
-      }))
+      return list.map((m) => ({ id: m.id, ...(m.name !== undefined ? { name: m.name } : {}) }))
     }
-    const discoverHandle = llm.registerModelDiscovery('workbuddy', discover)
+    const discoverHandle = llm.registerModelDiscovery(settingsNs, discover)
     ctx.effect(function* () {
       yield () => discoverHandle()
     }, 'workbuddy: model discovery lifecycle')
 
     ctx.logger.info(
-      `workbuddy: LLM route registered against ${baseURL} (management port ${mgmt.port}, realm ${realm})`,
+      `workbuddy: LLM route "${WORKBUDDY_PROVIDER}" registered against ${baseURL} ` +
+        `(management port ${mgmt.port}, realm ${realm}, settingsNs "${settingsNs}")`,
     )
   }
 
