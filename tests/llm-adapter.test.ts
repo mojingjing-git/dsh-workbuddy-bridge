@@ -410,13 +410,19 @@ describe('WorkbuddyLlmAdapter.stream', () => {
     const blockEnd = chunks.find((c) => c.type === 'block-end') as
       | {
           type: 'block-end'
-          block: { type: string; id: string; name: string; arguments: unknown }
+          block: { type: string; id: string; name: string; arguments: string }
         }
       | undefined
     expect(blockEnd).toBeDefined()
     expect(blockEnd?.block.type).toBe('tool-call')
     expect(blockEnd?.block.name).toBe('get_weather')
-    expect(blockEnd?.block.arguments).toEqual({ city: 'Beijing' })
+    // `ToolCallBlock.arguments` is a RAW JSON STRING in dsh-llm ("Raw JSON
+    // string as produced by the model"), not a parsed object. An earlier
+    // revision of this test asserted `toEqual({ city: 'Beijing' })` and so
+    // encoded the adapter bug instead of catching it: the runtime's
+    // dispatcher JSON.parses this field itself.
+    expect(typeof blockEnd?.block.arguments).toBe('string')
+    expect(JSON.parse(blockEnd!.block.arguments)).toEqual({ city: 'Beijing' })
     // The finish reason reflects the tool-call stop.
     const finish = chunks.find((c) => c.type === 'finish') as
       | { type: 'finish'; reason: { kind: string } }

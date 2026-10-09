@@ -59,6 +59,7 @@ import type {
   ContentBlock,
   ContentBlockType,
   TokenUsage,
+  ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 
 import { WorkbuddyClient, WorkbuddyClientError } from './workbuddy-client.js'
@@ -493,20 +494,223 @@ interface UpstreamChunk {
   }
 }
 
-interface BlockState {
-  type: 'text' | 'reasoning' | 'tool-call'
-  text: string
-  toolId: string
-  toolName: string
-  toolArgs: string
+// ---------------------------------------------------------------------------
+// SSE -> StreamChunk translation.
+//
+// DSH's `BlockAssembler` keys blocks by `index` and explicitly supports
+// interleaved deltas ("Block indexes correlate interleaved deltas"), so the
+// translator keeps one open block per kind instead of a single "current"
+// block. That matters for wb2api: a model may emit reasoning, then visible
+// text, then one or more tool calls in the same response, and it may address
+// parallel tool calls through `tool_calls[].index`.
+//
+// Each open block accumulates its content so the terminal `block-end` chunk
+// can carry the assembled block, which is what the `StreamChunk` contract
+// documents. Omitting `block-end` is also legal (the assembler is documented
+// as "tolerant of delta-only protocols"), but emitting it keeps this adapter
+// symmetric with the runtimes that do send one.
+
+interface UpstreamToolCallDelta {
+  index?: number
+  id?: string
+  type?: 'function'
+  function?: { name?: string; arguments?: string }
 }
 
-function blockTypeToName(type: ContentBlockType): string {
-  // The ContentBlockType union is not exported as a literal list; we
-  // map by convention. If DSH adds a new block type in a later
-  // version, the string we emit still parses (DSH treats unknown
-  // values as opaque).
-  return type
+interface OpenTextBlock {
+  index: number
+  text: string
+}
+
+interface OpenToolCall {
+  index: number
+  id: string
+  name: string
+  args: string
+}
+
+class StreamTranslator {
+  private nextIndex = 0
+  private text: OpenTextBlock | null = null
+  private reasoning: OpenTextBlock | null = null
+  /** Keyed by the upstream `tool_calls[].index` (absent means 0). */
+  private readonly toolCalls = new Map<number, OpenToolCall>()
+  private finished = false
+
+  /** Whether a terminal `finish` chunk has already been emitted. */
+  get hasFinished(): boolean {
+    return this.finished
+  }
+
+  /** Translate one upstream chat.completion.chunk into zero or more chunks. */
+  push(upstream: UpstreamChunk): StreamChunk[] {
+    const out: StreamChunk[] = []
+    const choice = upstream.choices?.[0]
+
+    if (choice !== undefined) {
+      const delta = choice.delta
+      if (delta !== undefined) {
+        this.appendToolCalls(delta.tool_calls, out)
+        this.appendText(delta.content, out)
+        this.appendReasoning(delta.reasoning_content, out)
+      }
+      if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
+        out.push(...this.closeAll())
+        out.push({ type: 'finish', reason: mapFinishReason(choice.finish_reason) })
+        this.finished = true
+      }
+    }
+
+    if (upstream.usage !== undefined) {
+      out.push({ type: 'usage', usage: usageFromUpstream(upstream.usage) })
+    }
+    return out
+  }
+
+  /**
+   * Close every open block, in a deterministic order: reasoning, then text,
+   * then tool calls. The order only matters for readability of the emitted
+   * stream; the assembler orders by `index`.
+   */
+  closeAll(): StreamChunk[] {
+    const out: StreamChunk[] = []
+    if (this.reasoning !== null) {
+      out.push(reasoningBlockEnd(this.reasoning))
+      this.reasoning = null
+    }
+    if (this.text !== null) {
+      out.push(textBlockEnd(this.text))
+      this.text = null
+    }
+    for (const call of this.toolCalls.values()) {
+      out.push(toolCallBlockEnd(call))
+    }
+    this.toolCalls.clear()
+    return out
+  }
+
+  /** No open blocks remain. */
+  get idle(): boolean {
+    return this.text === null && this.reasoning === null && this.toolCalls.size === 0
+  }
+
+  /**
+   * The blocks an interruption may keep. Text and reasoning with non-blank
+   * content only: an interrupted tool call was never dispatched, so keeping
+   * it would require a fabricated result. DSH's own
+   * `BlockAssembler.interruptedBlocks()` drops tool calls for the same reason.
+   */
+  partialBlocks(): ContentBlock[] {
+    const out: ContentBlock[] = []
+    if (this.reasoning !== null && this.reasoning.text.trim().length > 0) {
+      out.push({ type: 'reasoning', text: this.reasoning.text } as unknown as ContentBlock)
+    }
+    if (this.text !== null && this.text.text.trim().length > 0) {
+      out.push({ type: 'text', text: this.text.text } as unknown as ContentBlock)
+    }
+    return out
+  }
+
+  private appendText(content: string | null | undefined, out: StreamChunk[]): void {
+    if (typeof content !== 'string' || content.length === 0) return
+    if (this.text === null) {
+      this.text = { index: this.nextIndex++, text: '' }
+      out.push({ type: 'block-start', index: this.text.index, blockType: 'text' })
+    }
+    this.text.text += content
+    out.push({ type: 'text-delta', index: this.text.index, text: content })
+  }
+
+  private appendReasoning(content: string | null | undefined, out: StreamChunk[]): void {
+    if (typeof content !== 'string' || content.length === 0) return
+    if (this.reasoning === null) {
+      this.reasoning = { index: this.nextIndex++, text: '' }
+      out.push({ type: 'block-start', index: this.reasoning.index, blockType: 'reasoning' })
+    }
+    this.reasoning.text += content
+    out.push({ type: 'reasoning-delta', index: this.reasoning.index, text: content })
+  }
+
+  private appendToolCalls(
+    calls: readonly UpstreamToolCallDelta[] | undefined,
+    out: StreamChunk[],
+  ): void {
+    if (calls === undefined) return
+    for (const call of calls) {
+      const key = call.index ?? 0
+      let state = this.toolCalls.get(key)
+      if (state === undefined) {
+        state = { index: this.nextIndex++, id: '', name: '', args: '' }
+        this.toolCalls.set(key, state)
+        out.push({ type: 'block-start', index: state.index, blockType: 'tool-call' })
+      }
+      // OpenAI sends the whole id on the opening delta and split name /
+      // argument fragments afterwards, so the id is replaced while the name
+      // and arguments are concatenated.
+      if (typeof call.id === 'string' && call.id.length > 0) state.id = call.id
+      const nameDelta = call.function?.name
+      if (typeof nameDelta === 'string' && nameDelta.length > 0) state.name += nameDelta
+      const argsDelta = call.function?.arguments ?? ''
+      state.args += argsDelta
+
+      const delta: StreamChunk = {
+        type: 'tool-call-delta',
+        index: state.index,
+        id: state.id as ToolCallId,
+        ...(typeof nameDelta === 'string' && nameDelta.length > 0 ? { name: nameDelta } : {}),
+        argumentsDelta: argsDelta,
+      }
+      out.push(delta)
+    }
+  }
+}
+
+function textBlockEnd(state: OpenTextBlock): StreamChunk {
+  return {
+    type: 'block-end',
+    index: state.index,
+    block: { type: 'text', text: state.text } as unknown as ContentBlock,
+  }
+}
+
+function reasoningBlockEnd(state: OpenTextBlock): StreamChunk {
+  return {
+    type: 'block-end',
+    index: state.index,
+    block: { type: 'reasoning', text: state.text } as unknown as ContentBlock,
+  }
+}
+
+function toolCallBlockEnd(call: OpenToolCall): StreamChunk {
+  // `ToolCallBlock.arguments` is a RAW JSON STRING in dsh-llm ("Raw JSON
+  // string as produced by the model"), not a parsed object. The runtime's own
+  // assembler builds the same value by concatenating
+  // `tool-call-delta.argumentsDelta`, and a `block-end` block is adopted
+  // verbatim — so parsing here would hand DSH an object where it expects a
+  // string, and the tool dispatch would fail on JSON.parse.
+  return {
+    type: 'block-end',
+    index: call.index,
+    block: {
+      type: 'tool-call',
+      id: call.id as ToolCallId,
+      name: call.name,
+      arguments: call.args,
+    } as unknown as ContentBlock,
+  }
+}
+
+/**
+ * Whether a stream signal has fired.
+ *
+ * A plain function rather than an inline `signal?.aborted === true` check:
+ * TypeScript narrows `signal.aborted` to `false` after an early return, and
+ * does not widen it again across an `await`, even though the signal can flip
+ * while the reader is suspended. Going through a call boundary keeps the
+ * check honest.
+ */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal !== undefined && signal.aborted
 }
 
 async function* parseSseStream(
@@ -515,57 +719,69 @@ async function* parseSseStream(
 ): AsyncIterable<StreamChunk> {
   const reader = body.getReader()
   const decoder = new TextDecoder('utf-8')
+  const translator = new StreamTranslator()
   let buffer = ''
-  let current: BlockState | null = null
-  let blockIndex = 0
 
   try {
     while (true) {
-      if (signal?.aborted) {
-        yield {
-          type: 'finish',
-          reason: { kind: 'aborted', failure: { message: 'workbuddy: stream aborted', code: 'CALL_CANCELLED' } },
-        }
-        return
+      if (isAborted(signal)) {
+        throw new WorkbuddyLlmError('workbuddy: stream aborted', 'CALL_CANCELLED')
       }
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
+
+      // Reading is wrapped so an abort-induced rejection from the reader
+      // becomes our own CALL_CANCELLED rather than a bare DOMException.
+      let chunkValue: Uint8Array | undefined
+      let streamDone = false
+      try {
+        const read = await reader.read()
+        chunkValue = read.value
+        streamDone = read.done
+      } catch (e) {
+        if (isAborted(signal)) {
+          throw new WorkbuddyLlmError('workbuddy: stream aborted', 'CALL_CANCELLED')
+        }
+        throw new WorkbuddyLlmError(
+          `workbuddy: SSE read failed: ${e instanceof Error ? e.message : String(e)}`,
+          'STREAM_READ_FAILED',
+        )
+      }
+      if (streamDone) break
+      if (chunkValue !== undefined) buffer += decoder.decode(chunkValue, { stream: true })
 
       let boundary = buffer.indexOf('\n\n')
       while (boundary !== -1) {
         const rawEvent = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
+
         for (const line of rawEvent.split('\n')) {
           if (!line.startsWith('data:')) continue
           const data = line.slice(5).trim()
           if (data === '[DONE]') {
-            yield closeCurrent(current, blockIndex)
-            current = null
-            yield { type: 'finish', reason: { kind: 'stop' } }
+            if (!translator.hasFinished) {
+              for (const chunk of translator.closeAll()) yield chunk
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            }
             return
           }
           let parsed: UpstreamChunk
           try {
             parsed = JSON.parse(data) as UpstreamChunk
           } catch {
+            // A malformed frame is skipped rather than failing the whole
+            // response; the stream may still carry usable deltas.
             continue
           }
-          for (const out of translateChunk(parsed, current, blockIndex)) {
-            if (out.startsNewBlock && out.newState !== null) {
-              current = out.newState
-            }
-            if (out.closesBlock && current !== null) {
-              const finished = current
-              current = null
-              blockIndex += 1
-              yield finishedBlock(finished, blockIndex - 1)
-            }
-            if (out.chunk !== null) yield out.chunk
-          }
+          for (const chunk of translator.push(parsed)) yield chunk
         }
         boundary = buffer.indexOf('\n\n')
       }
+    }
+
+    // The body ended without `[DONE]`. Close whatever is open so the
+    // assembler is not left with a dangling partial.
+    if (!translator.hasFinished) {
+      for (const chunk of translator.closeAll()) yield chunk
+      yield { type: 'finish', reason: { kind: 'stop' } }
     }
   } finally {
     try {
@@ -576,256 +792,10 @@ async function* parseSseStream(
   }
 }
 
-interface TranslateOutput {
-  chunk: StreamChunk | null
-  startsNewBlock: boolean
-  newState: BlockState | null
-  closesBlock: boolean
-}
-
-function translateChunk(
-  upstream: UpstreamChunk,
-  current: BlockState | null,
-  blockIndex: number,
-): TranslateOutput[] {
-  const out: TranslateOutput[] = []
-  const choice = upstream.choices?.[0]
-  if (choice === undefined) {
-    if (upstream.usage !== undefined) {
-      out.push({
-        chunk: { type: 'usage', usage: usageFromUpstream(upstream.usage) },
-        startsNewBlock: false,
-        newState: null,
-        closesBlock: false,
-      })
-    }
-    return out
-  }
-  const delta = choice.delta
-  if (delta === undefined) {
-    return out
-  }
-
-  // Tool call deltas. Each entry may carry a partial id, name, and
-  // an arguments JSON string. We accumulate the full arguments
-  // string until finish_reason arrives.
-  if (delta.tool_calls !== undefined && delta.tool_calls.length > 0) {
-    // A tool call may arrive after a text block; close the text
-    // block first if it is still open.
-    if (current !== null && current.type === 'text') {
-      const closed = current
-      current = null
-      blockIndex += 1
-      out.push({
-        chunk: finishedBlock(closed, blockIndex - 1),
-        startsNewBlock: false,
-        newState: null,
-        closesBlock: true,
-      })
-    }
-    if (current === null || current.type !== 'tool-call') {
-      // First delta for a new tool call: open the block.
-      const tc = delta.tool_calls[0]!
-      const newState: BlockState = {
-        type: 'tool-call',
-        text: '',
-        toolId: tc.id ?? '',
-        toolName: tc.function?.name ?? '',
-        toolArgs: tc.function?.arguments ?? '',
-      }
-      out.push({
-        chunk: { type: 'block-start', index: blockIndex, blockType: 'tool-call' },
-        startsNewBlock: true,
-        newState,
-        closesBlock: false,
-      })
-    } else {
-      // Subsequent delta: append to the running tool call.
-      const tc = delta.tool_calls[0]!
-      if (tc.id !== undefined && tc.id.length > 0) current.toolId = tc.id
-      if (tc.function?.name !== undefined && tc.function.name.length > 0) {
-        current.toolName = tc.function.name
-      }
-      if (tc.function?.arguments !== undefined && tc.function.arguments.length > 0) {
-        current.toolArgs += tc.function.arguments
-      }
-    }
-    for (const tc of delta.tool_calls) {
-      const id = tc.id ?? (current?.toolId ?? '')
-      const nameDelta = tc.function?.name ?? ''
-      const argsDelta = tc.function?.arguments ?? ''
-      if (id.length > 0 || nameDelta.length > 0 || argsDelta.length > 0) {
-        out.push({
-          chunk: {
-            type: 'tool-call-delta',
-            index: blockIndex,
-            id: id as unknown as StreamChunk extends { type: 'tool-call-delta'; id: infer I } ? I : never,
-            ...(nameDelta.length > 0 ? { name: nameDelta } : {}),
-            argumentsDelta: argsDelta,
-          },
-          startsNewBlock: false,
-          newState: null,
-          closesBlock: false,
-        })
-      }
-    }
-  }
-
-  // Text delta.
-  if (typeof delta.content === 'string' && delta.content.length > 0) {
-    if (current === null || current.type !== 'text') {
-      // Open a new text block.
-      const newState: BlockState = {
-        type: 'text',
-        text: delta.content,
-        toolId: '',
-        toolName: '',
-        toolArgs: '',
-      }
-      current = newState
-      out.push({
-        chunk: { type: 'block-start', index: blockIndex, blockType: 'text' },
-        startsNewBlock: true,
-        newState,
-        closesBlock: false,
-      })
-    } else {
-      current.text += delta.content
-    }
-    out.push({
-      chunk: { type: 'text-delta', index: blockIndex, text: delta.content },
-      startsNewBlock: false,
-      newState: null,
-      closesBlock: false,
-    })
-  }
-
-  // Reasoning delta. Some wb2api models emit `reasoning_content`
-  // alongside `content`. We treat them as a separate block kind
-  // so the user can render them in a different style.
-  if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
-    if (current !== null && current.type === 'text') {
-      // Close the text block before opening reasoning so the
-      // block indexes stay monotone.
-      const closed = current
-      current = null
-      blockIndex += 1
-      out.push({
-        chunk: finishedBlock(closed, blockIndex - 1),
-        startsNewBlock: false,
-        newState: null,
-        closesBlock: true,
-      })
-    }
-    if (current === null || current.type !== 'reasoning') {
-      const newState: BlockState = {
-        type: 'reasoning',
-        text: delta.reasoning_content,
-        toolId: '',
-        toolName: '',
-        toolArgs: '',
-      }
-      current = newState
-      out.push({
-        chunk: { type: 'block-start', index: blockIndex, blockType: 'reasoning' },
-        startsNewBlock: true,
-        newState,
-        closesBlock: false,
-      })
-    } else {
-      current.text += delta.reasoning_content
-    }
-    out.push({
-      chunk: { type: 'reasoning-delta', index: blockIndex, text: delta.reasoning_content },
-      startsNewBlock: false,
-      newState: null,
-      closesBlock: false,
-    })
-  }
-
-  // Terminal finish_reason.
-  if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
-    if (current !== null) {
-      const closed = current
-      current = null
-      blockIndex += 1
-      out.push({
-        chunk: finishedBlock(closed, blockIndex - 1),
-        startsNewBlock: false,
-        newState: null,
-        closesBlock: true,
-      })
-    }
-    out.push({
-      chunk: {
-        type: 'finish',
-        reason: mapFinishReason(choice.finish_reason),
-      },
-      startsNewBlock: false,
-      newState: null,
-      closesBlock: false,
-    })
-  }
-
-  if (upstream.usage !== undefined) {
-    out.push({
-      chunk: { type: 'usage', usage: usageFromUpstream(upstream.usage) },
-      startsNewBlock: false,
-      newState: null,
-      closesBlock: false,
-    })
-  }
-  return out
-}
-
-function closeCurrent(
-  current: BlockState | null,
-  blockIndex: number,
-): StreamChunk {
-  if (current === null) {
-    return { type: 'finish', reason: { kind: 'stop' } }
-  }
-  return finishedBlock(current, blockIndex)
-}
-
-function finishedBlock(state: BlockState, index: number): StreamChunk {
-  // ContentBlock is a discriminated union in dsh-llm. v0.2 builds
-  // it from the running state. The cast through `unknown` is
-  // intentional: we have to materialise one of the union members
-  // and we know which one based on `state.type`.
-  if (state.type === 'text') {
-    const block: ContentBlock = { type: 'text', text: state.text } as unknown as ContentBlock
-    return { type: 'block-end', index, block }
-  }
-  if (state.type === 'reasoning') {
-    const block: ContentBlock = { type: 'reasoning', text: state.text } as unknown as ContentBlock
-    return { type: 'block-end', index, block }
-  }
-  // tool-call
-  let parsedArgs: unknown = {}
-  if (state.toolArgs.length > 0) {
-    try {
-      parsedArgs = JSON.parse(state.toolArgs)
-    } catch {
-      // Partial JSON is possible on the last delta; surface the
-      // raw string so the harness can decide what to do.
-      parsedArgs = state.toolArgs
-    }
-  }
-  const block = {
-    type: 'tool-call',
-    id: state.toolId,
-    name: state.toolName,
-    arguments: parsedArgs,
-  } as unknown as ContentBlock
-  return { type: 'block-end', index, block }
-}
-
 function usageFromUpstream(u: NonNullable<UpstreamChunk['usage']>): TokenUsage {
-  // dsh-llm TokenUsage requires inputTokens + outputTokens; the
-  // provider's `prompt_tokens` may include cached tokens, so we
-  // surface the total as totalTokens and leave cache fields
-  // absent unless the provider breaks them out.
+  // dsh-llm TokenUsage requires inputTokens + outputTokens; the provider's
+  // `prompt_tokens` may fold cached tokens in, so we surface the totals as
+  // given and leave the cache fields absent rather than inventing a split.
   const usage: TokenUsage = {
     inputTokens: typeof u.prompt_tokens === 'number' ? u.prompt_tokens : 0,
     outputTokens: typeof u.completion_tokens === 'number' ? u.completion_tokens : 0,
@@ -838,9 +808,9 @@ function mapFinishReason(reason: string): FinishReason {
   // dsh-llm `FinishReason` is an OBJECT union, not a string union:
   //   { kind: 'stop' } | { kind: 'tool-calls' } | { kind: 'max-tokens' }
   //   | { kind: 'aborted'; failure } | { kind: 'error'; failure }
-  // OpenAI's `length` means the model hit max output tokens, which
-  // maps to `max-tokens`; `tool_calls` maps to `tool-calls`;
-  // everything else (including `content_filter`) is a normal stop.
+  // OpenAI's `length` means the model hit its output cap, which maps to
+  // `max-tokens`; `tool_calls` maps to `tool-calls`; everything else
+  // (including `content_filter`) is a normal stop.
   switch (reason) {
     case 'length':
       return { kind: 'max-tokens' }
@@ -869,4 +839,3 @@ export function workbuddyConfigurableProvider(
   }
 }
 
-void blockTypeToName // reserved for future block-type routing
