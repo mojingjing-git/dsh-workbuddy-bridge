@@ -128,6 +128,22 @@ export interface WorkbuddyPluginContext {
    * service, whose effects land on the service's own fiber.
    */
   llm?: LlmRuntime
+  /**
+   * The `authorization` service as cordis exposes it on the context.
+   *
+   * Same reasoning as `llm` above, and it matters for the same reason.
+   * `AuthorizationService.registerFlow()` registers the flow through
+   * `this.ctx.effect()`, so **which context it is called on decides which fiber
+   * owns the registration**. Reached via `ctx.get('authorization')` the raw
+   * service is used, the effect lands on the service's own fiber, and the flow
+   * is never withdrawn when this plugin unloads — a reload then hits
+   * `DUPLICATE_FLOW`, and the stale flow keeps offering a sign-in that can no
+   * longer complete.
+   *
+   * The property form binds `this.ctx` to this plugin's context at call time,
+   * which puts the registration in this plugin's fiber.
+   */
+  authorization?: AuthorizationService
 }
 
 /** Where the mount journal is written. Readable from outside the app. */
@@ -237,8 +253,10 @@ export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): voi
           `workbuddy: no API key resolved (apiKeyEnv="${route.apiKeyEnv}"). ` +
             'Set the env var or enter the key in DSH Models page.',
         )
-        // Mount the OAuth flow anyway so the user can sign in.
-        await mountOAuthFlow(ctx, route)
+        // Mount the OAuth flow anyway so the user can sign in. This is the
+        // no-key path, so there is no LLM route to wait on first — but the
+        // credential lookups above already awaited.
+        await mountOAuthFlow(ctx, route, journal, isRevoked)
         return
       }
 
@@ -405,6 +423,13 @@ async function mountEverything(
   // does not change out from under it. The key is never written to the journal.
   const management = await resolveManagementKey(ctx, journal)
 
+  // The credential write inside `resolveManagementKey` is an await, and binding
+  // a socket is the next one. A superseded mount must not do either.
+  if (isRevoked()) {
+    journal.record('managementKey', 'abandoned', { reason: 'fiber unloaded or re-applied' })
+    return
+  }
+
   // 1) Local management HTTP server (M08 contract).
   const mgmt: ManagementServerHandle = await startManagementServer({
     client,
@@ -529,7 +554,8 @@ async function mountEverything(
     }, 'workbuddy: model discovery lifecycle')
 
     // Probe the gateway once so the journal records whether the route can
-    // actually answer, rather than only that it was accepted.
+    // actually answer, rather than only that it was accepted. This is an
+    // upstream round trip, so it is also the longest await in the mount.
     try {
       const models = await adapter.listModels(WORKBUDDY_PROVIDER)
       journal.record('listModels', 'ok', {
@@ -543,6 +569,11 @@ async function mountEverything(
       })
     }
 
+    if (isRevoked()) {
+      journal.record('listModels', 'abandoned', { reason: 'superseded during the discovery probe' })
+      return
+    }
+
     ctx.logger.info(
       `workbuddy: LLM route "${WORKBUDDY_PROVIDER}" registered against ${baseURL} ` +
         `(management port ${mgmt.port}, realm ${realm}, settingsNs "${settingsNs}")`,
@@ -550,24 +581,53 @@ async function mountEverything(
     journal.record('mountEverything', 'complete', { managementPort: mgmt.port })
   }
 
-  // 4) OAuth flow (M10 contract).
-  await mountOAuthFlow(ctx, route, client)
+  // 4) OAuth flow (M10 contract). Guarded because the LLM block above waited on
+  // the network: registering an authorization flow on a fiber that has since
+  // unloaded is exactly the leak this check exists to prevent.
+  if (isRevoked()) {
+    journal.record('oauth', 'abandoned', { reason: 'superseded before the flow was registered' })
+    return
+  }
+  await mountOAuthFlow(ctx, route, journal, isRevoked, client)
 }
 
 async function mountOAuthFlow(
   ctx: WorkbuddyPluginContext,
   route: WorkbuddyProviderConfig,
+  journal: MountJournal,
+  isRevoked: () => boolean,
   client?: WorkbuddyClient,
 ): Promise<void> {
   // If we don't have a client (no key yet), build one without one. The flow
   // will resolve its own key from the credentials service.
   const c = client ?? new WorkbuddyClient({ baseURL: route.baseURL ?? DEFAULT_WB2API_BASEURL, apiKey: '' })
 
-  const authorization = ctx.get('authorization') as AuthorizationService | undefined
+  // The property form first, for the same reason `llm` is reached that way:
+  // `registerFlow()` calls `this.ctx.effect()` internally, so the context it is
+  // invoked on decides which fiber owns the registration. Via `ctx.get()` the
+  // raw service is used and the flow survives this plugin's unload, which turns
+  // a reload into `DUPLICATE_FLOW` and leaves a sign-in button that cannot work.
+  const authorizationProperty = ctx.authorization
+  const authorizationFromLookup = ctx.get('authorization') as AuthorizationService | undefined
+  const authorization = authorizationProperty ?? authorizationFromLookup
   const credentials = ctx.get('credentials') as CredentialsService | undefined
+
+  journal.record('oauth', authorization === undefined ? 'service UNAVAILABLE' : 'service found', {
+    via:
+      authorizationProperty !== undefined
+        ? 'ctx.authorization'
+        : authorizationFromLookup !== undefined
+          ? "ctx.get('authorization')"
+          : 'neither',
+    // Recorded because the two are not equivalent: only the property form ties
+    // the flow's lifetime to this plugin's fiber.
+    lifetimeOwnedByThisFiber: authorizationProperty !== undefined,
+    credentials: credentials === undefined ? 'unavailable' : 'found',
+  })
+
   if (authorization === undefined || credentials === undefined) {
     ctx.logger.warn(
-      'workbuddy: ctx.authorization or ctx.credentials not available; OAuth flow not registered. ' +
+      'workbuddy: authorization or credentials unavailable; OAuth flow not registered. ' +
         'This usually means the DSH desktop bundle does not enable dsh-authorization or dsh-credentials.',
     )
     return
@@ -578,6 +638,10 @@ async function mountOAuthFlow(
   // auth (M03 evidence). We resolve the same key the LLM uses.
   if (!client) {
     const apiKey = await resolveApiKey(ctx, route)
+    if (isRevoked()) {
+      journal.record('oauth', 'abandoned', { reason: 'superseded while resolving the key' })
+      return
+    }
     if (apiKey === undefined) {
       ctx.logger.warn('workbuddy: cannot register OAuth flow without a resolvable API key')
       return
@@ -590,6 +654,14 @@ async function mountOAuthFlow(
     credentials,
     workbuddy: c,
     realm: route.realm,
+  })
+  journal.record('oauth', 'flow registered', {
+    // `registerFlow` returns void and takes no disposer, so the flow's lifetime
+    // is whatever `this.ctx.effect()` bound inside the service. With the
+    // property form that is this plugin's fiber; with the lookup form it is not,
+    // and the flow outlives the plugin. False here is a reload hazard, not a
+    // cosmetic difference.
+    lifetimeOwnedByThisFiber: authorizationProperty !== undefined,
   })
   ctx.logger.info('workbuddy: OAuth flow registered')
 }

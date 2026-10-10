@@ -147,41 +147,80 @@ export class WorkbuddyClient {
     }
 
     const ac = new AbortController()
-    const timer = setTimeout(() => ac.abort(new Error('workbuddy: request timeout')), this.requestTimeoutMs)
+    const timer = setTimeout(
+      () => ac.abort(new Error('workbuddy: request timeout')),
+      this.requestTimeoutMs,
+    )
 
-    let response: Response
+    // The timer covers reading the body, not just receiving the headers.
+    //
+    // It used to be cleared in a `finally` around the `fetch` call, which fires
+    // as soon as the response *headers* arrive — so `response.text()` below ran
+    // with no timeout at all. A server that sends headers promptly and then
+    // stalls mid-body (a wedged gateway, a proxy holding the connection) would
+    // hang this request forever. That is worst on the OAuth poll path, which is
+    // a loop of exactly these requests.
     try {
-      response = await this.fetchImpl(this.baseURL + path, {
-        method,
-        headers,
-        body: opts.json !== undefined ? JSON.stringify(opts.json) : undefined,
-        signal: ac.signal,
-      })
+      let response: Response
+      try {
+        response = await this.fetchImpl(this.baseURL + path, {
+          method,
+          headers,
+          body: opts.json !== undefined ? JSON.stringify(opts.json) : undefined,
+          signal: ac.signal,
+        })
+      } catch (e) {
+        throw this.timeoutOr(e, method, path, ac)
+      }
+
+      // Also inside the timer, and also able to be the thing that times out: a
+      // server that flushes headers and then stalls is the case the old code
+      // missed entirely.
+      let text: string
+      try {
+        text = await response.text()
+      } catch (e) {
+        throw this.timeoutOr(e, method, path, ac)
+      }
+
+      if (!response.ok) {
+        throw new WorkbuddyClientError(
+          `workbuddy: ${method} ${path} → HTTP ${response.status}`,
+          response.status,
+          text,
+        )
+      }
+      if (text.length === 0) {
+        // No body (e.g. 204). Caller is responsible for the void return type.
+        return undefined as unknown as T
+      }
+      try {
+        return JSON.parse(text) as T
+      } catch (e) {
+        throw new WorkbuddyClientError(
+          `workbuddy: ${method} ${path} → invalid JSON in response: ${(e as Error).message}`,
+          response.status,
+          text,
+        )
+      }
     } finally {
       clearTimeout(timer)
     }
+  }
 
-    const text = await response.text()
-    if (!response.ok) {
-      throw new WorkbuddyClientError(
-        `workbuddy: ${method} ${path} → HTTP ${response.status}`,
-        response.status,
-        text,
-      )
-    }
-    if (text.length === 0) {
-      // No body (e.g. 204). Caller is responsible for the void return type.
-      return undefined as unknown as T
-    }
-    try {
-      return JSON.parse(text) as T
-    } catch (e) {
-      throw new WorkbuddyClientError(
-        `workbuddy: ${method} ${path} → invalid JSON in response: ${(e as Error).message}`,
-        response.status,
-        text,
-      )
-    }
+  /**
+   * Turn an abort into a named timeout, and pass anything else through.
+   *
+   * Only when *our* timer is what aborted: the caller may pass its own signal
+   * for a different request, and reporting that as a timeout would be wrong.
+   */
+  private timeoutOr(error: unknown, method: string, path: string, ac: AbortController): unknown {
+    if (!ac.signal.aborted) return error
+    return new WorkbuddyClientError(
+      `workbuddy: ${method} ${path} → timed out after ${this.requestTimeoutMs}ms`,
+      0,
+      '',
+    )
   }
 }
 

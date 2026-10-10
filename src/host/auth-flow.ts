@@ -43,10 +43,25 @@ export interface AuthorizationFlow {
   run(session: AuthorizationSession): Promise<void>
 }
 
-/** Minimal shape of the DSH credentials service this flow needs. */
+/** Branded credential reference; the brand is compile-time only. */
+type CredentialRef = string & { readonly __credentialRef?: unique symbol }
+
+/** Written under the reference once a sign-in succeeds. */
+const OAUTH_BOUND_MARKER = 'bound'
+
+/**
+ * Minimal shape of the DSH credentials service this flow needs.
+ *
+ * The two signatures are transcribed from `@deepseek-ai/dsh-credentials`, not
+ * invented: v0.1 declared `set({ name, value })` and `describe({ name, value })`
+ * with the value folded into the reference, and `set` taking one argument.
+ * Neither exists upstream, so the sign-in path could not have written anything.
+ */
 export interface CredentialsService {
-  set(ref: { name: string; value: string }): Promise<void>
-  describe(ref: { name: string; value: string }): Promise<{ configured: boolean; writable: boolean }>
+  /** `abstract set(ref: CredentialRef, value: string): Promise<void>` */
+  set(ref: CredentialRef, value: string): Promise<void>
+  /** `abstract describe(ref: CredentialRef): Promise<CredentialInfo>` */
+  describe(ref: CredentialRef): Promise<{ configured: boolean; writable: boolean }>
 }
 
 export interface WorkbuddyAuthFlowDeps {
@@ -101,12 +116,24 @@ export async function runWorkbuddyOAuth(
   }
 
   // Mark the DSH credential store that at least one wb2api account is bound.
-  // The actual refresh token lives in wb2api's own auths/ directory; we
-  // only persist a marker so the client UI can show "signed in".
-  const ref = { name: WORKBUDDY_OAUTH_CREDENTIAL_KEY, value: 'bound' }
-  const info = await deps.credentials.describe(ref).catch(() => ({ configured: false, writable: true }))
-  if (info.writable) {
-    await deps.credentials.set(ref)
+  // The actual refresh token lives in wb2api's own auths/ directory; this only
+  // persists a marker so the UI can show "signed in".
+  //
+  // The signatures below are the real ones, verified against
+  // `@deepseek-ai/dsh-credentials`:
+  //
+  //     abstract describe(ref: CredentialRef): Promise<CredentialInfo>
+  //     abstract set(ref: CredentialRef, value: string): Promise<void>
+  //
+  // Both take a single branded reference, not the `{ name, value }` pair v0.1
+  // invented for `describe`, and `set` takes the value as a **second positional
+  // argument** rather than reading it off the reference. The v0.1 shapes are
+  // why this flow reported success without ever writing anything: the objects
+  // were the wrong shape, so the calls could not have stored a marker.
+  const ref = WORKBUDDY_OAUTH_CREDENTIAL_KEY as CredentialRef
+  const info = await deps.credentials.describe(ref).catch(() => undefined)
+  if (info === undefined || info.writable !== false) {
+    await deps.credentials.set(ref, OAUTH_BOUND_MARKER)
   }
   session.notify({ message: '登录成功，账号已添加到 wb2api。' })
 }

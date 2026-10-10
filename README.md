@@ -174,49 +174,61 @@ than assumed, and several of them changed the implementation:
 
 ### Module boundaries
 
-The built output imports nothing from `@deepseek-ai/*` at runtime — every such
-import is `import type` and is erased by `tsc`. The only runtime import is
-`zod`, a declared dependency. This matters because DSH provides those packages
-through `ctx`; importing them would load a second copy beside the bundle's own.
+The built output imports nothing from `@deepseek-ai/*` at runtime except
+`schemastery`, which is a real declared dependency because the loader needs it
+to project the config schema. Every other `@deepseek-ai/*` import is
+`import type` and is erased by `tsc` — DSH provides those packages through
+`ctx`, and importing them would load a second copy beside the bundle's own.
+
+The full runtime import set is `node:*` builtins, `@deepseek-ai/schemastery`,
+and relative paths inside the plugin. Nothing else.
 
 `@deepseek-ai/cordis` is the single `peerDependency`, because the plugin must
 share the host's instance.
+
+### The bridge to dsh-cost-meter
+
+`dsh-cost-meter` is not a dependency. It reaches this plugin over loopback HTTP,
+through a contract pinned to its own parser
+(`lib/gateway-quota-adapters.js#parseWorkBuddyCredits`, v1.8.15), and
+`tests/cost-meter-contract.test.ts` asserts against **that parser** rather than
+against a copy of its expectations.
 
 ## Verification
 
 ### What is proven
 
-- **83 tests pass** (`pnpm test`), and `tsc --noEmit` is clean **including the
-  tests** — the tests were previously outside the type check, which let several
-  calls violate the official types while passing.
-- **`tests/message-serialization.test.ts`** asserts the complete `messages`
-  array the adapter puts on the wire, for user text, the system prompt, the
-  full assistant-tool_calls / tool-tool_call_id round trip, parallel tool
-  calls, and the blocks that must not reach the provider.
-- **`tests/simulated-e2e.test.ts`** drives the adapter through the DSH
-  runtime's own consumers — `BlockAssembler`, `createUserMessage`,
-  `createToolResultMessage` — rather than through mocks of the plugin's own
-  making. It covers a text turn, a tool-call turn, a full two-turn round trip,
-  parallel tool calls, max-token truncation, a `global:` rejection, and an
-  interrupted stream.
-- The build imports nothing from `@deepseek-ai/*` at runtime.
+- **The LLM round trip on a real desktop.** A DSH Desktop Agent completed a turn
+  on the `workbuddy` route in which a tool ran and returned a retrievable
+  artifact. The evidence is DSH's own records plus the tool's output, not this
+  repository's claims: [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md).
+- **The full test suite passes** (`pnpm test`) and `tsc --noEmit` is clean
+  **including the tests** — they were previously outside the type check, which
+  let several calls violate the official types while passing.
+- **`tests/cost-meter-contract.test.ts`** loads the installed
+  `parseWorkBuddyCredits` and feeds it the payload this plugin produces. It says
+  so loudly when no installed copy is findable rather than passing quietly, so a
+  green run on a machine without DSH is weaker than one with it — the acceptance
+  record is the stronger evidence.
+- **`tests/simulated-e2e.test.ts`** drives the adapter through the runtime's own
+  consumers — `BlockAssembler`, `createUserMessage`, `createToolResultMessage` —
+  rather than through mocks of the plugin's own making.
+- **`scripts/manual/`** runs the real adapter against a live gateway, which is
+  what unit tests structurally cannot do.
 
 ### What is not proven
 
-- **The acceptance gate.** No real DSH desktop run has happened. Nothing below
-  is covered by a test:
-  - that DSH loads the plugin and `ctx.llm` is reachable;
-  - that the user's chosen model supports tool calls at all (the gateway
-    advertises 19 models and they are not equivalent);
-  - that a real tool executes and its result lands back in the model context.
-- **The simulated E2E is not a substitute.** It uses the runtime's real
-  assembly and message code, which is much stronger than a hand-written mock,
-  but it cannot exercise plugin loading or a live gateway.
-- **Nothing about a real gateway response** beyond the P0 probes recorded in
-  `docs/probe/`.
-
-Run the desktop acceptance test with
-[`docs/probe/BATCH2-E2E-RUNBOOK.md`](./docs/probe/BATCH2-E2E-RUNBOOK.md).
+- **OAuth sign-in.** `auth-flow.ts` has not been rewritten for the official
+  contract; the flow registers but the credential commit path is Batch 3.
+- **The client UI.** The dock badge renders; nothing else does.
+- **A balance in the UI.** The payload contract passes against the real parser;
+  no balance has been seen rendering on a real install.
+- **Repeated load / unload / reload.** The revocation checks and the
+  socket-leak fix have unit coverage only; a real Cordis fiber cycling has not
+  been exercised.
+- **The simulated E2E is not a substitute** for any of the above. It uses the
+  runtime's real assembly and message code, which is much stronger than a
+  hand-written mock, but it cannot exercise plugin loading or a live gateway.
 
 ## Development
 
@@ -234,16 +246,24 @@ tables the contracts were derived from — lives in
 
 ## Known limitations
 
-- **OAuth, credentials, the client surface and the cost-meter payload are still
-  the v0.1 implementations.** They were written against guessed contracts;
-  rewriting them is Batch 3. In particular the credential calls use
-  `set({ name, value })` where DSH's signature is `set(ref, value)`.
+- **The client surface is still the v0.1 implementation.** `client.js` targets a
+  `window.__DSH_REMOTE__` that no installed plugin uses and guesses slot names.
+  The dock badge renders; nothing else does. Rewriting it is Batch 3.
+- **OAuth is registered but not finished.** The flow's credential calls now use
+  the real `set(ref, value)` / `describe(ref)` signatures, but the flow itself
+  has not been through a real sign-in, and the registration's lifetime depends
+  on reaching `ctx.authorization` as a property rather than through `ctx.get()`.
 - **No realm routing.** The global realm is refused at all three entry points
   (model discovery, resolution, dispatch) rather than stripped, because wb2api
   routes a bare id to CN and the request would silently answer from the wrong
   realm. The probe gateway had zero global accounts.
 - **The adapter is text-only.** It declares `inputModalities: ['text']`, so
-  image content reaches it as a placeholder rather than as image input.
+  image content reaches it as a placeholder rather than as image input, even
+  though the gateway advertises `supports_images: true` for all 19 models.
+- **The per-model credit multiplier is not surfaced.** The gateway advertises it
+  (`credits`, with promo fields on `/panel/api/models`), but DSH's
+  `LlmModelInfo` carries only `name` and `description`, so there is nowhere in
+  the model catalog to put it. It needs the client UI.
 - **Not published to npm.**
 
 ## License
