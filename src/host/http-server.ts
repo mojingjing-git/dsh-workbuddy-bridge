@@ -11,7 +11,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { WorkbuddyClient, WorkbuddyClientError } from './workbuddy-client.js'
 import {
   adaptWb2apiStatusToWorkbuddyCredits,
@@ -27,6 +27,15 @@ export interface ManagementServerOptions {
    * server refuses all requests (safe default).
    */
   managementKey: string
+  /**
+   * Port to listen on. Defaults to 0 (OS picks a free one).
+   *
+   * The consumer of this endpoint — dsh-cost-meter — is configured with a
+   * baseURL the user types in, so a port that changes every restart has to be
+   * re-typed every restart. A fixed default makes that configuration a one-off;
+   * 0 remains available for callers that want isolation instead.
+   */
+  port?: number
   /** Override for tests. Defaults to global fetch (unused here). */
   fetchImpl?: typeof fetch
   /** Override for tests (real Node listen). */
@@ -34,9 +43,9 @@ export interface ManagementServerOptions {
 }
 
 export interface ManagementServerHandle {
-  /** Bound host:port (e.g. `http://127.0.0.1:53421`). */
+  /** Bound host:port (e.g. `http://127.0.0.1:7710`). */
   baseURL: string
-  /** Port OS assigned when `listen(0)` was used. */
+  /** The port actually bound, whatever was requested. */
   port: number
   /** Close the server. */
   close(): Promise<void>
@@ -45,9 +54,8 @@ export interface ManagementServerHandle {
 /**
  * Start the management server.
  *
- * - Listens on `127.0.0.1:0` so the OS picks a free port (M09 decision:
- *   avoids EADDRINUSE, lets multiple workbuddy-bridge instances coexist
- *   for testing).
+ * - Listens on `127.0.0.1` only. The port is the caller's choice, defaulting
+ *   to an OS-assigned one; see `ManagementServerOptions.port`.
  * - Verifies `X-Management-Key` with a constant-time compare so a brute
  *   force scan does not leak the key through timing.
  * - Returns 200 + JSON body on success, 401 on bad key, 405 on non-GET,
@@ -57,13 +65,16 @@ export async function startManagementServer(
   opts: ManagementServerOptions,
 ): Promise<ManagementServerHandle> {
   const expectedKeyBuf = Buffer.from(opts.managementKey, 'utf8')
+  const requestedPort = opts.port ?? 0
   const server = createServer((req, res) => {
     void handle(req, res, opts, expectedKeyBuf)
   })
 
   const port = await new Promise<number>((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
+    // 127.0.0.1, never `0.0.0.0`: this endpoint answers with account balances
+    // and is gated only by a bearer-style header.
+    server.listen(requestedPort, '127.0.0.1', () => {
       const addr = server.address()
       if (addr === null || typeof addr === 'string') {
         reject(new Error('workbuddy management server: cannot get bound address'))
@@ -145,11 +156,18 @@ function writeJson(res: ServerResponse, status: number, body: unknown, contentTy
   }
 }
 
-/** Stable management key for dsh-cost-meter's `X-Management-Key` header. */
+/**
+ * Management key for the loopback management server.
+ *
+ * `randomBytes`, not a hash of `Math.random()`. The server is bound to
+ * loopback, which lowers the exposure but is not a reason to weaken the
+ * credential: loopback is reachable by every local process and every browser
+ * page on the machine, and a V8 `Math.random()` stream is not a CSPRNG — its
+ * internal state is recoverable from a handful of outputs.
+ *
+ * 32 bytes, hex-encoded, matching the length the DSH credential store and
+ * dsh-cost-meter's management-key field both accept.
+ */
 export function defaultManagementKey(): string {
-  // 32 bytes of randomness from the hash of the current Node process pid +
-  // a random source. The key never leaves the host process, so entropy
-  // uniqueness is sufficient.
-  const seed = `${process.pid}.${Date.now()}.${Math.random()}`
-  return createHash('sha256').update(seed).digest('hex')
+  return randomBytes(32).toString('hex')
 }

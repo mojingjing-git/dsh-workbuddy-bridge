@@ -64,17 +64,26 @@ describe('startManagementServer', () => {
     })
     expect(response.status).toBe(200)
     const body = (await response.json()) as {
-      accounts: Array<{ authIndex: number; credits: { used: number; remaining: number; limit: number; fetchedAt: string } }>
+      accounts: Array<{
+        auth_index: number
+        credits: {
+          total_used: number
+          total_remain: number
+          total_size: number
+          fetched_at: string
+        }
+      }>
     }
     expect(body.accounts.length).toBe(1)
+    // The names on the wire are the ones dsh-cost-meter's parser reads, not the
+    // ones it builds internally. See tests/cost-meter-contract.test.ts.
     expect(body.accounts[0]).toEqual({
-      authIndex: 0,
+      auth_index: 0,
       credits: {
-        unit: 'credits',
-        used: 1000,
-        remaining: 3000,
-        limit: 4000,
-        fetchedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        total_used: 1000,
+        total_remain: 3000,
+        total_size: 4000,
+        fetched_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         packages: [],
       },
     })

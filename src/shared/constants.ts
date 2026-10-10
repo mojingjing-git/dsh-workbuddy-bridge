@@ -7,6 +7,15 @@
 
 export const PLUGIN_NAME = 'workbuddy'
 
+/**
+ * The package version, for the upstream `user-agent`.
+ *
+ * Must equal `version` in package.json; `tests/attribution.test.ts` fails if the
+ * two drift, because a header that reports a version the package does not have
+ * is worse than one that reports none.
+ */
+export const PLUGIN_VERSION = '0.1.0'
+
 /** wb2api default listening address (plan §1.1: `:7863` not loopback-only). */
 export const DEFAULT_WB2API_BASEURL = 'http://127.0.0.1:7863'
 
@@ -15,6 +24,21 @@ export const COST_METER_CREDITS_PATH = '/v0/management/plugins/workbuddy/credits
 
 /** Poll interval for wb2api /panel/api/login/poll (M03 evidence: 3s). */
 export const OAUTH_POLL_INTERVAL_MS = 3_000
+
+/**
+ * Credential reference holding this plugin's management key.
+ *
+ * dsh-cost-meter authenticates against the plugin's loopback management server
+ * with a key the user stores under a name derived from their gateway-source id:
+ * `CLIPROXYAPI_MANAGEMENT_KEY_<ID>_<HASH>` (see `managementKeyVarOf` in
+ * dsh-cost-meter). That name is not knowable from here — the user picks the id —
+ * so this plugin keeps its own copy under this reference instead, and the two
+ * are made to agree by copying the value once.
+ *
+ * Persisting it is what makes the endpoint configurable at all: a key
+ * regenerated per start could never be pasted anywhere durable.
+ */
+export const MANAGEMENT_KEY_CREDENTIAL = 'WORKBUDDY_MANAGEMENT_KEY'
 
 /** Hard cap on an OAuth attempt so an abandoned window does not pin resources. */
 export const OAUTH_TIMEOUT_MS = 5 * 60 * 1000

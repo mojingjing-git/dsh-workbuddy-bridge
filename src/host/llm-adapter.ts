@@ -63,6 +63,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 
 import { WorkbuddyClient, WorkbuddyClientError } from './workbuddy-client.js'
+import { attributionHeaders } from './attribution.js'
 import { MODELS_CACHE_TTL_MS } from '../shared/constants.js'
 
 // ---------------------------------------------------------------------------
@@ -191,19 +192,48 @@ export function parseModelId(id: string): ParsedModelId {
 
 import type { LlmError as DshLlmError } from '@deepseek-ai/dsh-llm'
 
-/** A local class that mimics the DSH `LlmError` shape. We do not
- *  extend it across the import-type boundary because the real
- *  class lives inside the bundle and the plugin never has access
- *  to it at runtime. The runtime's `instanceof` checks would
- *  fail, but `LlmRuntime.stream()` accepts any thrown value and
- *  normalises it by reading the `code` and `message` fields.
+/** Adapter failure carrying both a live `Error` and the serializable
+ *  snapshot the DSH runtime actually reads.
+ *
+ *  Extending `Error` alone is not enough, and an earlier comment here claimed
+ *  the runtime "normalises it by reading the `code` and `message` fields".
+ *  It does not. `LlmRuntime` runs whatever an adapter throws through
+ *  `normalizeLlmFailure`, whose fallback is:
+ *
+ *      function harnessErrorCode(error) {
+ *        return error instanceof HarnessError ? error.code : "UNKNOWN"
+ *      }
+ *
+ *  This class is not an instance of DSH's `HarnessError` — it cannot be, since
+ *  a plugin may not import `@deepseek-ai/*` at runtime — so every code chosen
+ *  here (`PROVIDER_HTTP`, `STREAM_TRUNCATED`, `CALL_CANCELLED`, …) was being
+ *  discarded and reported as `UNKNOWN`.
+ *
+ *  The runtime provides exactly one way out:
+ *
+ *      const carried = ownFailureSnapshot(error)              // own `failure`
+ *      if (carried !== undefined && carried.code === ownErrorCode(error)) return carried
+ *
+ *  It reads the error's **own** `failure` property and uses it only when its
+ *  `code` equals the error's **own** `code`. Both must therefore be own
+ *  properties and must stay equal, which is why they are assigned together from
+ *  one value below.
  */
 export class WorkbuddyLlmError extends Error {
   readonly code: string
-  constructor(message: string, code: string) {
-    super(message)
+  /** Serializable facts retained beside the live Error; read by the runtime. */
+  readonly failure: { readonly message: string; readonly code: string; readonly status?: number }
+
+  constructor(message: string, code: string, options?: { status?: number; cause?: unknown }) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause })
     this.name = 'WorkbuddyLlmError'
     this.code = code
+    // `failure.code` must equal `code` or the runtime ignores the snapshot.
+    this.failure = Object.freeze({
+      message,
+      code,
+      ...(options?.status === undefined ? {} : { status: options.status }),
+    })
   }
 }
 
@@ -425,13 +455,17 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.client.apiKey}`,
+          // This path is a direct fetch rather than a WorkbuddyClient call, so
+          // it needs the attribution header of its own. Without it the busiest
+          // request the plugin makes is the one that arrives upstream unnamed.
+          ...attributionHeaders(),
         },
         body: JSON.stringify(body),
         signal: options.signal,
       })
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e)
-      throw new WorkbuddyLlmError(`workbuddy: fetch failed: ${reason}`, 'FETCH_FAILED')
+      throw new WorkbuddyLlmError(`workbuddy: fetch failed: ${reason}`, 'FETCH_FAILED', { cause: e })
     }
 
     if (!response.ok || response.body === null) {
@@ -439,6 +473,7 @@ export class WorkbuddyLlmAdapter implements LlmAdapter {
       throw new WorkbuddyLlmError(
         `workbuddy: HTTP ${response.status} ${text.slice(0, 200)}`,
         'PROVIDER_HTTP',
+        { status: response.status },
       )
     }
 

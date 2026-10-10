@@ -53,7 +53,7 @@ export interface WorkbuddyProviderConfig {
   apiKeyEnv: string
   baseURL: string
   realm: Realm
-  apiKey?: string
+  managementPort: number
 }
 
 export interface WorkbuddyConfig {
@@ -105,14 +105,39 @@ const workbuddyProviderSchema = z.object({
     .union([z.const('cn'), z.const('global')])
     .default('cn')
     .description('Realm to route. `cn` only in v0.2; `global` is refused at every entry point.'),
-  /** Literal key override. Intended for tests; prefer `apiKeyEnv`. */
-  apiKey: z
-    .string()
+  /**
+   * Port for the loopback management server dsh-cost-meter reads.
+   *
+   * Exists so the endpoint is **stable**. The value has to be typed into
+   * cost-meter's own gateway-source settings, and a random port would have to
+   * be re-typed after every restart; `0` still asks the OS for an ephemeral
+   * port for callers who do not want one.
+   *
+   * Out-of-range values are rejected here rather than at `listen()`, where the
+   * error surfaces as an opaque `EACCES`/`EADDRINUSE` after the mount has
+   * already begun.
+   */
+  managementPort: z
+    .number()
+    .min(0)
+    // 65535 is the largest valid TCP port. Rejected here rather than at
+    // `listen()`, where it surfaces as an opaque `EACCES`/`EADDRINUSE` after
+    // the mount has already begun.
+    .max(65535)
+    .default(7710)
     .description(
-      'Literal API key. Prefer apiKeyEnv so the secret stays in the credential store.',
+      'Loopback port for the dsh-cost-meter bridge. Default 7710; 0 picks a ' +
+        'random free port, which must then be re-read from the diagnostics file after each restart.',
     ),
+  // NOTE: there is deliberately no `apiKey` here.
+  //
+  // A literal key in the config schema means a plaintext secret in
+  // `cordis.patch.yml`, in the profile directory, in any backup of it, and in
+  // whatever the Models page round-trips. The credential store exists so that
+  // does not have to happen, and `apiKeyEnv` is the supported route. The
+  // programmatic seam for tests is the `literalApiKey` parameter of
+  // `resolveApiKey`, which no config can reach.
 })
-
 const configSchema = z.object({
   providers: z.dict(workbuddyProviderSchema).default({}),
 })

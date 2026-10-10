@@ -55,8 +55,46 @@ describe('Config schema', () => {
     expect(parsed.providers.workbuddy).toBeUndefined()
   })
 
-  it('drops an omitted optional field rather than inventing one', () => {
+  it('defaults the management port so the cost-meter endpoint is stable', () => {
     const parsed = Config({ providers: { workbuddy: { apiKeyEnv: 'X' } } })
-    expect(parsed.providers.workbuddy?.apiKey).toBeUndefined()
+    expect(parsed.providers.workbuddy?.managementPort).toBe(7710)
+  })
+
+  it('rejects a management port outside the usable range', () => {
+    // Caught here rather than at listen(), where it would surface as an opaque
+    // EACCES/EADDRINUSE after the mount had already begun.
+    expect(() => Config({ providers: { workbuddy: { apiKeyEnv: 'X', managementPort: 70000 } } })).toThrow()
+    expect(() => Config({ providers: { workbuddy: { apiKeyEnv: 'X', managementPort: -1 } } })).toThrow()
+  })
+
+  it('does not advertise an apiKey field to the settings surface', () => {
+    // The field was removed on purpose: a literal key in the schema means the
+    // Models page offers a box to paste a plaintext secret into, and it lands
+    // in cordis.patch.yml and the profile directory.
+    //
+    // Asserted on the projected *field names* rather than on the serialized
+    // blob, which would also match the `apiKeyEnv` field this schema does have.
+    const projected = Config.toJSON() as { refs?: Record<string, { dict?: Record<string, number> }> }
+    const fieldNames = Object.values(projected.refs ?? {}).flatMap((node) =>
+      Object.keys(node.dict ?? {}),
+    )
+    expect(fieldNames).toContain('apiKeyEnv')
+    expect(fieldNames).not.toContain('apiKey')
+  })
+
+  it('cannot strip an undeclared apiKey, which is why apply() ignores it', () => {
+    // This asserts the schemastery behaviour that makes the check in `apply()`
+    // necessary rather than optional. Verified against
+    // @deepseek-ai/schemastery 3.18.4: object schemas pass undeclared keys
+    // through, and there is no `.strict()`, `.loose()`, or `.extra()` that
+    // changes it.
+    //
+    // If this expectation ever flips — a future schemastery that strips unknown
+    // keys — the belt-and-braces check in `apply()` becomes redundant, and this
+    // failing test is how anyone would find that out.
+    const parsed = Config({
+      providers: { workbuddy: { apiKeyEnv: 'X', apiKey: 'sk-plaintext-should-not-survive' } },
+    })
+    expect(JSON.stringify(parsed)).toContain('sk-plaintext-should-not-survive')
   })
 })

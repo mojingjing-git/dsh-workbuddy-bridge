@@ -45,6 +45,7 @@ import {
   PLUGIN_NAME,
   DEFAULT_WB2API_BASEURL,
   COST_METER_CREDITS_PATH,
+  MANAGEMENT_KEY_CREDENTIAL,
 } from '../shared/constants.js'
 import { WorkbuddyClient } from './workbuddy-client.js'
 import {
@@ -140,6 +141,28 @@ export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): voi
   // something diagnosable after the fact.
   const journal = new MountJournal()
 
+  /**
+   * Revoked when this fiber unloads, or when a re-apply supersedes this call.
+   *
+   * Registering the revoker **synchronously**, before the first await, is the
+   * point: everything below runs in a promise chain that outlives `apply()`,
+   * and without a revocation check a mount that was already abandoned still
+   * runs to completion — starting a management server on a random port and
+   * registering an LLM route with the previous key and URL, on a fiber that no
+   * longer exists to dispose either.
+   *
+   * `apply` is synchronous, so the fiber is necessarily active here and this
+   * effect cannot be refused.
+   */
+  let revoked = false
+  ctx.effect(function* () {
+    yield () => {
+      revoked = true
+    }
+  }, 'workbuddy: mount attempt revocation')
+
+  const isRevoked = (): boolean => revoked
+
   journal.record('apply', 'entered', {
     hasConfig: config !== undefined && config !== null,
     providers: config?.providers === undefined ? 'undefined' : Object.keys(config.providers),
@@ -165,12 +188,46 @@ export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): voi
     realm: route.realm,
   })
 
+  // Removing `apiKey` from the schema does not keep it out of the config.
+  //
+  // schemastery objects do not strip undeclared keys. Verified against
+  // @deepseek-ai/schemastery 3.18.4: `z.object({ a })({ a: '1', secret: 'x' })`
+  // returns `{ a: '1', secret: 'x' }`, and neither `.loose()` nor `.extra()`
+  // changes that — there is no `.strict()`. So a literal key written into
+  // `cordis.patch.yml` still arrives here.
+  //
+  // The schema removal is still worth doing (the field is no longer advertised
+  // to the settings surface, so nothing invites anyone to paste a secret into a
+  // plaintext file), but the actual protection is refusing to *read* it. Only
+  // the credential store is a supported source.
+  const strayApiKey = (route as { apiKey?: unknown }).apiKey
+  if (typeof strayApiKey === 'string' && strayApiKey.length > 0) {
+    journal.record('apply', 'ignored a literal apiKey', { length: strayApiKey.length })
+    ctx.logger.warn(
+      'workbuddy: this route carries a literal apiKey, which is ignored. A key in the ' +
+        'config file is a plaintext secret in the profile directory and in any copy of ' +
+        `it. Use credentials: store the key under "${route.apiKeyEnv}" instead.`,
+    )
+  }
+
   // Resolve API key. We try (in order):
   //   1. route.apiKey (test override or literal user value)
   //   2. ctx.credentials resolving the env-var name from route.apiKeyEnv
   //   3. the env var directly (fallback when no credentials service exists)
-  resolveApiKey(ctx, route)
-    .then((apiKey) => {
+  //
+  // Written as one async function rather than a `.then()` chain so that every
+  // await is followed by a revocation check. The chain form made the gaps
+  // invisible: `resolveApiKey` and the management-server bind are both awaits,
+  // and a config change during either one previously let the rest of the mount
+  // proceed against values that were already superseded.
+  void (async () => {
+    try {
+      const apiKey = await resolveApiKey(ctx, route)
+      if (isRevoked()) {
+        journal.record('resolveApiKey', 'abandoned', { reason: 'fiber unloaded or re-applied' })
+        return
+      }
+
       if (apiKey === undefined) {
         journal.record('resolveApiKey', 'failed', {
           apiKeyEnv: route.apiKeyEnv,
@@ -181,27 +238,17 @@ export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): voi
             'Set the env var or enter the key in DSH Models page.',
         )
         // Mount the OAuth flow anyway so the user can sign in.
-        return mountOAuthFlow(ctx, route).catch((e) =>
-          ctx.logger.error(`workbuddy oauth: ${(e as Error).message}`),
-        )
+        await mountOAuthFlow(ctx, route)
+        return
       }
+
       journal.record('resolveApiKey', 'resolved', { length: apiKey.length })
-      return mountEverything(ctx, route, apiKey, journal).catch((e) => {
-        journal.record('mountEverything', 'THREW', {
-          name: (e as Error)?.name,
-          message: (e as Error)?.message,
-          code: (e as { code?: string })?.code,
-          stack: ((e as Error)?.stack ?? '').split('\n').slice(0, 6).join('\n'),
-        })
-        ctx.logger.error(`workbuddy host mount failed: ${(e as Error).message}`)
-      })
-    })
-    .catch((e) => {
-      journal.record('apply', 'unexpected rejection', {
-        message: (e as Error)?.message,
-        stack: ((e as Error)?.stack ?? '').split('\n').slice(0, 6).join('\n'),
-      })
-    })
+      await mountEverything(ctx, route, apiKey, journal, isRevoked)
+    } catch (e) {
+      journal.recordFailure('mount', e)
+      ctx.logger.error(`workbuddy host mount failed: ${(e as Error).message}`)
+    }
+  })()
 }
 
 /**
@@ -219,8 +266,19 @@ class MountJournal {
   }
 
   record(step: string, outcome: string, detail?: Record<string, unknown>): void {
-    const entry = { at: new Date().toISOString(), step, outcome, ...(detail ?? {}) }
+    const entry = {
+      at: new Date().toISOString(),
+      step,
+      outcome,
+      ...redactDetail(detail),
+    }
     this.steps.push(entry)
+    // Bounded, oldest-first: the journal is a diagnostic, not a log sink. A
+    // mount that retries on every config change could otherwise grow it without
+    // limit in the user's home directory.
+    if (this.steps.length > MAX_JOURNAL_STEPS) {
+      this.steps.splice(0, this.steps.length - MAX_JOURNAL_STEPS)
+    }
     try {
       writeFileSync(MOUNT_JOURNAL_PATH, JSON.stringify({ steps: this.steps }, null, 2), 'utf8')
     } catch {
@@ -228,11 +286,104 @@ class MountJournal {
     }
     try {
       // eslint-disable-next-line no-console
-      console.log(`workbuddy[mount] ${step}: ${outcome}`, detail ?? '')
+      console.log(`workbuddy[mount] ${step}: ${outcome}`, entry)
     } catch {
       // console may be absent in a packaged renderer; ignore.
     }
   }
+
+  /**
+   * Record a thrown value without writing a stack trace to disk.
+   *
+   * Stacks were the one genuinely sensitive thing this file used to carry: they
+   * contain absolute paths and, through embedded frame arguments, whatever the
+   * failing call happened to hold. The class name, message and code are what
+   * make a failure diagnosable; the frames are not, and they are the part that
+   * should not be sitting in a file under the user's home directory.
+   */
+  recordFailure(step: string, error: unknown): void {
+    const e = error as { name?: string; message?: string; code?: string; status?: number }
+    this.record(step, 'THREW', {
+      name: e?.name,
+      message: e?.message,
+      code: e?.code,
+      status: e?.status,
+    })
+  }
+}
+
+/** How many steps the journal keeps. Enough for a full mount, then it rolls. */
+const MAX_JOURNAL_STEPS = 200
+
+/** Longest string kept per field, so one value cannot bloat the file. */
+const MAX_JOURNAL_VALUE_CHARS = 400
+
+/**
+ * Strip the parts of a diagnostic value that should not be written to disk.
+ *
+ * Three things, and only three, because a journal that drops everything is a
+ * journal nobody can use:
+ *
+ *   - **Stacks** are removed entirely (see `recordFailure`).
+ *   - **URLs keep their origin and lose the rest.** `http://127.0.0.1:7863` is
+ *     the fact worth recording; a path or query could carry a token, and
+ *     userinfo definitely could.
+ *   - **Long strings are truncated.** An upstream response body pasted into a
+ *     message is both unbounded and the likeliest place for a leaked secret.
+ *
+ * Errors and other objects are reduced to their own enumerable scalars, one
+ * level deep, so a nested request object cannot smuggle a header through.
+ */
+function redactDetail(detail: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (detail === undefined) return {}
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(detail)) {
+    if (key === 'stack') continue
+    out[key] = redactValue(value)
+  }
+  return out
+}
+
+function redactValue(value: unknown): unknown {
+  if (typeof value === 'string') return redactString(value)
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value
+  if (value === undefined) return undefined
+  if (value instanceof Error) {
+    return { name: value.name, message: redactString(value.message) }
+  }
+  if (Array.isArray(value)) return value.slice(0, 20).map(redactValue)
+  if (typeof value === 'object') {
+    const nested: Record<string, unknown> = {}
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'stack') continue
+      nested[key] = redactValue(inner)
+    }
+    return nested
+  }
+  return String(value)
+}
+
+function redactString(text: string): string {
+  // Keep origin, drop path/query/fragment/userinfo.
+  const trimmed = text.trim()
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      return new URL(trimmed).origin
+    } catch {
+      return '<unparseable url>'
+    }
+  }
+  // A URL embedded in a longer message (e.g. "connect http://x/y failed").
+  const scrubbed = trimmed.replace(/https?:\/\/[^\s"')]+/gi, (match) => {
+    try {
+      return new URL(match).origin
+    } catch {
+      return '<url>'
+    }
+  })
+  return scrubbed.length > MAX_JOURNAL_VALUE_CHARS
+    ? `${scrubbed.slice(0, MAX_JOURNAL_VALUE_CHARS)}…[truncated]`
+    : scrubbed
 }
 
 async function mountEverything(
@@ -240,6 +391,7 @@ async function mountEverything(
   route: WorkbuddyProviderConfig,
   apiKey: string,
   journal: MountJournal,
+  isRevoked: () => boolean,
 ): Promise<void> {
   const baseURL = (route.baseURL ?? DEFAULT_WB2API_BASEURL).replace(/\/+$/, '')
   const realm = route.realm
@@ -249,23 +401,70 @@ async function mountEverything(
   const settingsNs = PLUGIN_NAME
 
   const client = new WorkbuddyClient({ baseURL, apiKey })
-  const managementKey = defaultManagementKey()
+  // Stable across restarts, so the endpoint dsh-cost-meter is configured with
+  // does not change out from under it. The key is never written to the journal.
+  const management = await resolveManagementKey(ctx, journal)
 
   // 1) Local management HTTP server (M08 contract).
   const mgmt: ManagementServerHandle = await startManagementServer({
     client,
-    managementKey,
+    managementKey: management.key,
+    ...(route.managementPort === undefined ? {} : { port: route.managementPort }),
   })
-  ctx.effect(function* () {
-    yield async () => {
-      await mgmt.close()
-    }
-  }, 'workbuddy: management server lifecycle')
+
+  // The server is listening before its disposer exists, and there is a real
+  // window between those two facts: `startManagementServer` awaits, and the
+  // fiber can go inactive during that await. `ctx.effect` on an inactive fiber
+  // throws `INACTIVE_EFFECT`, so the disposer below would never be registered
+  // and the listening socket would outlive the plugin with nothing able to
+  // close it. Catching that specific case and closing here is the only thing
+  // that keeps the socket from leaking; then the error is rethrown so the
+  // caller still learns the mount failed.
+  try {
+    ctx.effect(function* () {
+      yield async () => {
+        await mgmt.close()
+      }
+    }, 'workbuddy: management server lifecycle')
+  } catch (error) {
+    await mgmt.close().catch(() => {
+      // Already closing, or the socket is gone. Nothing further to do; the
+      // original registration failure is the error worth reporting.
+    })
+    journal.record('managementServer', 'closed after effect refused', {
+      port: mgmt.port,
+      reason: (error as Error)?.message,
+    })
+    throw error
+  }
+
+  if (isRevoked()) {
+    // Superseded while binding. The disposer is registered, so the socket is
+    // reachable by the fiber's teardown — but a superseded mount must not go on
+    // to register a route with the key and URL it was started with.
+    journal.record('managementServer', 'abandoned after bind', { port: mgmt.port })
+    return
+  }
 
   ctx.logger.info(
     `workbuddy: management server bound at ${mgmt.baseURL}${COST_METER_CREDITS_PATH}`,
   )
-  journal.record('managementServer', 'listening', { port: mgmt.port, baseURL: mgmt.baseURL })
+  // Records everything needed to configure dsh-cost-meter, and nothing secret.
+  // This is the delivery path that was missing: the consumer reads a user-typed
+  // baseURL and a credential, so both have to be discoverable from outside the
+  // app, and the journal is the only channel that survives it.
+  journal.record('managementServer', 'listening', {
+    port: mgmt.port,
+    baseURL: mgmt.baseURL,
+    path: COST_METER_CREDITS_PATH,
+    keyCredentialRef: MANAGEMENT_KEY_CREDENTIAL,
+    keySource: management.source,
+    costMeter: {
+      sourceType: 'workbuddy',
+      baseURL: mgmt.baseURL,
+      credentialToFill: `copy the value of ${MANAGEMENT_KEY_CREDENTIAL} into the credential dsh-cost-meter derives from your source id (CLIPROXYAPI_MANAGEMENT_KEY_<ID>_<HASH>)`,
+    },
+  })
 
   // 2) LLM adapter (M02 contract). The adapter implements the
   //    official `LlmAdapter` abstract class shape via a type-only
@@ -412,6 +611,68 @@ type CredentialRef = string & { readonly __credentialRef?: unique symbol }
 /** The slice of the credentials service this plugin uses. */
 interface CredentialsLike {
   resolve(ref: CredentialRef): Promise<{ value: string; source: string } | undefined>
+  /**
+   * Write a credential. Two positional arguments, verified against
+   * `@deepseek-ai/dsh-credentials`:
+   *
+   *     abstract set(ref: CredentialRef, value: string): Promise<void>
+   *
+   * Optional here because a context without the credentials service still
+   * mounts — the key then lives only for the life of the process.
+   */
+  set?(ref: CredentialRef, value: string): Promise<void>
+}
+
+/**
+ * Reserve the management key so it survives a restart.
+ *
+ * dsh-cost-meter reads the management endpoint with a key the user stores in
+ * DSH's credential store under a deterministic name derived from their source
+ * id (`managementKeyVarOf` in dsh-cost-meter). That only works if **our** key is
+ * stable: a fresh `randomBytes` per start would invalidate the user's
+ * configuration on every restart, and the two values could never be made to
+ * agree by hand.
+ *
+ * So: use the stored key when there is one, otherwise generate 32 bytes and
+ * persist them. Returns the key plus where it came from, which is what the
+ * diagnostics file reports — the key itself never is.
+ */
+async function resolveManagementKey(
+  ctx: WorkbuddyPluginContext,
+  journal: MountJournal,
+): Promise<{ key: string; source: 'stored' | 'generated' | 'ephemeral' }> {
+  const credentials = ctx.get('credentials') as CredentialsLike | undefined
+  const ref = MANAGEMENT_KEY_CREDENTIAL as CredentialRef
+
+  if (credentials !== undefined) {
+    try {
+      const resolved = await credentials.resolve(ref)
+      if (resolved !== undefined && resolved.value.length > 0) {
+        return { key: resolved.value, source: 'stored' }
+      }
+    } catch (e) {
+      journal.recordFailure('managementKey', e)
+    }
+  }
+
+  const generated = defaultManagementKey()
+
+  if (credentials?.set === undefined) {
+    journal.record('managementKey', 'generated, NOT persisted', {
+      reason: 'no credentials service on this context',
+      consequence: 'the key changes on every restart and the cost-meter source must be re-keyed',
+    })
+    return { key: generated, source: 'ephemeral' }
+  }
+
+  try {
+    await credentials.set(ref, generated)
+    journal.record('managementKey', 'generated and persisted', { ref: MANAGEMENT_KEY_CREDENTIAL })
+    return { key: generated, source: 'generated' }
+  } catch (e) {
+    journal.recordFailure('managementKey', e)
+    return { key: generated, source: 'ephemeral' }
+  }
 }
 
 /**
@@ -425,9 +686,19 @@ interface CredentialsLike {
 async function resolveApiKey(
   ctx: WorkbuddyPluginContext,
   route: WorkbuddyProviderConfig,
+  /**
+   * Test seam: a literal key supplied programmatically.
+   *
+   * Deliberately a parameter rather than a config field. The config schema has
+   * no `apiKey`, so a plaintext secret cannot be written into
+   * `cordis.patch.yml` or round-tripped through the Models page — which is the
+   * only way to keep it out of the profile directory, its backups, and anything
+   * that reads them. Nothing in the config path can reach this argument.
+   */
+  literalApiKey?: string,
 ): Promise<string | undefined> {
-  if (route.apiKey !== undefined && route.apiKey.length > 0) {
-    return route.apiKey
+  if (literalApiKey !== undefined && literalApiKey.length > 0) {
+    return literalApiKey
   }
 
   // DSH's credential seam takes ONE branded reference, not the

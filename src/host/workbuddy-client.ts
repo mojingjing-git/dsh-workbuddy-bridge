@@ -14,6 +14,8 @@
 
 import { setTimeout as sleep } from 'node:timers/promises'
 
+import { attributionHeaders } from './attribution.js'
+
 export interface WorkbuddyClientOptions {
   baseURL: string
   apiKey: string
@@ -133,6 +135,9 @@ export class WorkbuddyClient {
   ): Promise<T> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
+      // Attribution, on every request. Without it these arrive upstream as
+      // `node` — undici's default, which names nothing.
+      ...attributionHeaders(),
     }
     if (opts.auth) {
       headers['Authorization'] = `Bearer ${this.apiKey}`
