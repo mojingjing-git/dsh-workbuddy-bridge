@@ -672,11 +672,37 @@ interface UpstreamChunk {
     }
     finish_reason?: string | null
   }>
+  /**
+   * Token accounting for the frame.
+   *
+   * `| null` is load-bearing, not defensive noise. wb2api sends
+   * `"usage": null` on **every** frame and fills it only on the last one —
+   * captured verbatim from the gateway:
+   *
+   *     data: {…,"finish_reason":null,…,"usage":null}
+   *     …
+   *     data: {…,"finish_reason":"stop",…,"usage":{…}}
+   *
+   * A `!== undefined` test therefore passes for null and the accounting code
+   * dereferences null. That is the crash the first real desktop run hit
+   * (`Cannot read properties of null (reading 'prompt_tokens')`) — the gateway
+   * had answered HTTP 200 and streamed the whole reply.
+   */
   usage?: {
     prompt_tokens?: number
     completion_tokens?: number
     total_tokens?: number
-  }
+    /** Read from the prompt cache. Three spellings across gateways. */
+    prompt_cache_hit_tokens?: number
+    cache_read_input_tokens?: number
+    cached_tokens?: number
+    /** Written to the prompt cache. Two spellings. */
+    prompt_cache_write_tokens?: number
+    cache_creation_input_tokens?: number
+    /** Reasoning tokens, billed as output. Two spellings. */
+    completion_thinking_tokens?: number
+    completion_tokens_details?: { reasoning_tokens?: number } | null
+  } | null
 }
 
 // ---------------------------------------------------------------------------
@@ -771,8 +797,11 @@ class StreamTranslator {
       }
     }
 
-    // Before the finish, always - whatever order the frames arrived in.
-    if (upstream.usage !== undefined) {
+    // Before the finish, always - whatever order the frames arrived in. The
+    // null test is the load-bearing half: wb2api sends `"usage": null` on every
+    // frame but the last, and `!== undefined` alone lets null through to the
+    // accounting code, which then dereferences it.
+    if (upstream.usage !== undefined && upstream.usage !== null) {
       out.push({ type: 'usage', usage: usageFromUpstream(upstream.usage) })
     }
     return out
@@ -1037,15 +1066,56 @@ async function* parseSseStream(
   }
 }
 
-function usageFromUpstream(u: NonNullable<UpstreamChunk['usage']>): TokenUsage {
-  // dsh-llm TokenUsage requires inputTokens + outputTokens; the provider's
-  // `prompt_tokens` may fold cached tokens in, so we surface the totals as
-  // given and leave the cache fields absent rather than inventing a split.
-  const usage: TokenUsage = {
-    inputTokens: typeof u.prompt_tokens === 'number' ? u.prompt_tokens : 0,
-    outputTokens: typeof u.completion_tokens === 'number' ? u.completion_tokens : 0,
+/** First defined number among the candidates, or undefined. */
+function firstNumber(...values: Array<number | undefined | null>): number | undefined {
+  for (const v of values) {
+    if (typeof v === 'number') return v
   }
-  if (typeof u.total_tokens === 'number') usage.totalTokens = u.total_tokens
+  return undefined
+}
+
+function usageFromUpstream(u: NonNullable<UpstreamChunk['usage']>): TokenUsage {
+  // dsh-llm's TokenUsage requires inputTokens and outputTokens; everything else
+  // is optional. The gateway's final frame carries far more than the two
+  // totals, and dropping the rest under-reports cost: reasoning tokens are
+  // billed as output, and cache reads are billed at a different rate than fresh
+  // input. Field capture from the live gateway:
+  //
+  //   prompt_tokens 13, completion_tokens 38, total_tokens 51,
+  //   prompt_cache_hit_tokens 0, prompt_cache_miss_tokens 13,
+  //   prompt_cache_write_tokens 0, cache_read_input_tokens 0,
+  //   cache_creation_input_tokens 0, cached_tokens 0,
+  //   completion_thinking_tokens 27,
+  //   completion_tokens_details { reasoning_tokens: 27, … }
+  //
+  // The same quantity arrives under several names because the gateway
+  // normalizes more than one upstream dialect. Each lookup prefers the most
+  // specific spelling and falls back, rather than picking one and silently
+  // reading zero from the others.
+  const usage: TokenUsage = {
+    inputTokens: firstNumber(u.prompt_tokens) ?? 0,
+    outputTokens: firstNumber(u.completion_tokens) ?? 0,
+  }
+
+  const total = firstNumber(u.total_tokens)
+  if (total !== undefined) usage.totalTokens = total
+
+  const cacheRead = firstNumber(
+    u.prompt_cache_hit_tokens,
+    u.cache_read_input_tokens,
+    u.cached_tokens,
+  )
+  if (cacheRead !== undefined) usage.cacheReadTokens = cacheRead
+
+  const cacheWrite = firstNumber(u.prompt_cache_write_tokens, u.cache_creation_input_tokens)
+  if (cacheWrite !== undefined) usage.cacheWriteTokens = cacheWrite
+
+  const reasoning = firstNumber(
+    u.completion_thinking_tokens,
+    u.completion_tokens_details?.reasoning_tokens,
+  )
+  if (reasoning !== undefined) usage.reasoningTokens = reasoning
+
   return usage
 }
 

@@ -689,3 +689,127 @@ describe('SSE — a body that ends early is not a normal completion', () => {
     expect(last.reason).toEqual({ kind: 'stop' })
   })
 })
+// ---------------------------------------------------------------------------
+// The exact wire format the gateway emits.
+//
+// Every fixture in this file used to omit `usage` entirely, so nothing ever
+// exercised the `"usage":null` frames that wb2api sends on *every* frame but
+// the last. The first real desktop run crashed on precisely that
+// (`Cannot read properties of null (reading 'prompt_tokens')`) after the
+// gateway had already answered HTTP 200 and streamed the whole reply.
+//
+// These frames are copied verbatim from the live gateway rather than composed,
+// so the shapes — including the leading `: heartbeat` comment and the trailing
+// frame that carries finish_reason and usage together — cannot drift from the
+// ones under test.
+
+describe('SSE — the gateway\'s real frame shapes', () => {
+  const CHUNK = (body: string) => `data: ${body}\n\n`
+
+  /** A mid-stream frame: no finish reason, and `usage` explicitly null. */
+  const NULL_USAGE_FRAME = CHUNK(
+    '{"choices":[{"delta":{"content":" can I"},"finish_reason":null,"index":0}],' +
+      '"created":1791600014,"id":"31efcac8","model":"hy3-x",' +
+      '"object":"chat.completion.chunk","usage":null}',
+  )
+
+  /** The final frame: finish_reason AND a populated usage object. */
+  const FINAL_FRAME = CHUNK(
+    '{"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}],' +
+      '"created":1791600014,"id":"31efcac8","model":"hy3-x",' +
+      '"object":"chat.completion.chunk","usage":{' +
+      '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cached_tokens":0,' +
+      '"completion_thinking_tokens":27,"completion_tokens":38,' +
+      '"completion_tokens_details":{"reasoning_tokens":27},' +
+      '"credit":0,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":13,' +
+      '"prompt_cache_write_tokens":0,"prompt_tokens":13,"total_tokens":51}}',
+  )
+
+  it('survives usage:null on every non-final frame', async () => {
+    // The regression. `"usage": null` is present on every frame; a
+    // `!== undefined` guard lets it through to the accounting code.
+    const adapter = makeAdapter({
+      rawBody:
+        ': heartbeat\n\n' +
+        CHUNK(
+          '{"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],' +
+            '"usage":null}',
+        ) +
+        NULL_USAGE_FRAME +
+        NULL_USAGE_FRAME +
+        FINAL_FRAME +
+        'data: [DONE]\n\n',
+    })
+
+    const chunks = await drain(adapter)
+    const types = chunks.map((c) => (c as { type: string }).type)
+    expect(types).toContain('text-delta')
+    expect(types[types.length - 1]).toBe('finish')
+    // Exactly one usage chunk, from the frame that carried a real object.
+    expect(types.filter((t) => t === 'usage').length).toBe(1)
+    // The null frames must not have produced an empty usage chunk.
+    const usageChunks = chunks.filter((c) => (c as { type: string }).type === 'usage')
+    expect(usageChunks.length).toBe(1)
+  })
+
+  it('maps the full usage object, not just the two totals', async () => {
+    const adapter = makeAdapter({ rawBody: NULL_USAGE_FRAME + FINAL_FRAME + 'data: [DONE]\n\n' })
+    const chunks = await drain(adapter)
+    const usage = chunks.find((c) => (c as { type: string }).type === 'usage') as
+      | { usage: Record<string, number> }
+      | undefined
+    expect(usage?.usage).toEqual({
+      inputTokens: 13,
+      outputTokens: 38,
+      totalTokens: 51,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 27,
+    })
+  })
+
+  it('skips the SSE comment line the gateway sends first', async () => {
+    const adapter = makeAdapter({
+      rawBody: ': heartbeat\n\n' + NULL_USAGE_FRAME + FINAL_FRAME + 'data: [DONE]\n\n',
+    })
+    const chunks = await drain(adapter)
+    const text = chunks
+      .filter((c) => (c as { type: string }).type === 'text-delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    // The comment must not leak into the content.
+    expect(text).toBe(' can I')
+  })
+
+  it('orders usage before the finish when one frame carries both', async () => {
+    // The shape the gateway actually sends last: finish_reason and usage in the
+    // same frame, with usage null on every frame before it.
+    const adapter = makeAdapter({ rawBody: NULL_USAGE_FRAME + FINAL_FRAME + 'data: [DONE]\n\n' })
+    const chunks = await drain(adapter)
+    const types = chunks.map((c) => (c as { type: string }).type)
+    expect(types.indexOf('usage')).toBeLessThan(types.indexOf('finish'))
+    expect(types.filter((t) => t === 'finish').length).toBe(1)
+  })
+
+  it('reads reasoning_content into a reasoning block', async () => {
+    const adapter = makeAdapter({
+      rawBody:
+        CHUNK('{"choices":[{"delta":{"reasoning_content":"The"},"usage":null}]}') +
+        CHUNK('{"choices":[{"delta":{"reasoning_content":" user"},"usage":null}]}') +
+        CHUNK('{"choices":[{"delta":{"content":"Hi"},"usage":null}]}') +
+        FINAL_FRAME +
+        'data: [DONE]\n\n',
+    })
+    const chunks = await drain(adapter)
+    const reasoning = chunks
+      .filter((c) => (c as { type: string }).type === 'reasoning-delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    expect(reasoning).toBe('The user')
+    const text = chunks
+      .filter((c) => (c as { type: string }).type === 'text-delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    expect(text).toBe('Hi')
+  })
+})
