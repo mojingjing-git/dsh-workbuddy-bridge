@@ -14,9 +14,6 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: 3.18.4
         version: 3.18.4
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
     devDependencies:
       '@deepseek-ai/dsh-llm':
         specifier: 0.2.1-alpha.2

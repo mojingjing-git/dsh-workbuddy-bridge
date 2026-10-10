@@ -55,3 +55,9 @@ backups/
 # Commit-message scratch files (never belong in a commit)
 .git-msg*.txt
 .git-commit-msg*.txt
+
+# Throwaway investigation scripts. The ones worth keeping live in
+# scripts/manual/ and are committed; these are the dot-prefixed drafts that
+# preceded them.
+.diag-*
+.diag*.mjs

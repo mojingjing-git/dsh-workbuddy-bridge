@@ -40,11 +40,12 @@
     "build:client": "node scripts/copy-client.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "e2e": "node scripts/manual/e2e.mjs",
+    "models:report": "node scripts/manual/models.mjs"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "3.18.4",
-    "zod": "^4.6.5"
+    "@deepseek-ai/schemastery": "3.18.4"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1-rc.1 <5.0.0-0"
