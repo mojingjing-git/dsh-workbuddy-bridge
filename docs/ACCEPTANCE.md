@@ -22,11 +22,25 @@ the log line is quoted.
 | Session | `faad75ff-3034-4a5b-a792-65d8922b7ce3` | `~/.dsh/storages/session_projcache/sessions/`; its turn timestamps match the gateway log to the second |
 | Config source | `~/.dsh/profiles/desktop/cordis.patch.yml`, entry `workbuddy` | `apiKeyEnv: ABC123_API_KEY`, `baseURL: http://127.0.0.1:7863`, `realm: cn` |
 
-Note the version skew: the `@deepseek-ai/*` type packages pinned in
-`package.json` are `0.2.1-alpha.2` while the running application reports
-`0.2.0-rc.2`. The compatibility range (`>=0.2.1-alpha.2 <0.3.0-0`) is expressed
-against the former, which is why the runtime-reported version is recorded
-separately here.
+### The version skew, and what is unresolved about it
+
+The `@deepseek-ai/*` type packages pinned in `package.json` are
+`0.2.1-alpha.2`. The running application reports `0.2.0-rc.2`. The compatibility
+range declares `>=0.2.1-alpha.2 <0.3.0-0`, expressed against the former.
+
+**These are two different numbers for the same installation, and the package
+that reads `dsh.compatibility` cannot be inspected from here** — it lives inside
+`app.asar`, and a search of the profile's installed packages finds no consumer of
+that field (the only `compatibility` matches are zod's internals). So it is not
+established whether the loader compares its range against the app's reported
+version or against the `dsh-llm` package version, and therefore whether
+`>=0.2.1-alpha.2` is satisfied by an app reporting `0.2.0-rc.2`.
+
+What *is* established is that the plugin loads and works on this installation,
+so whatever the check does, it passed here. Before publishing, the field should
+be confirmed against the loader's actual comparison rather than assumed — the
+failure mode of guessing wrong is a plugin that silently refuses to mount on a
+compatible host, or mounts on an incompatible one.
 
 ---
 
