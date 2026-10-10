@@ -43,6 +43,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.4",
     "zod": "^4.6.5"
   },
   "peerDependencies": {
@@ -72,4 +73,3 @@
     "node": ">=20"
   }
 }
-

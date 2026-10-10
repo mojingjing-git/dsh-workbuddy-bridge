@@ -28,15 +28,17 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-// Type-only imports from the DSH LLM seam. The runtime instance of
-// the `llm` service is provided by the DSH desktop bundle via
-// `ctx.get('llm')`; the plugin never imports this package at runtime
-// (the bundle has its own copy).
+// Type-only imports from the DSH LLM seam. The runtime instance of the `llm`
+// service is provided by the DSH desktop bundle; the plugin never imports this
+// package at runtime (the bundle has its own copy).
 import type {
   LlmDiscoveredModel,
   LlmModelDiscoveryRequest,
   LlmRuntime,
 } from '@deepseek-ai/dsh-llm'
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 
 import { Config, type WorkbuddyConfig, type WorkbuddyProviderConfig } from './schema.js'
 import {
@@ -114,14 +116,39 @@ export interface WorkbuddyPluginContext {
   on: EventOnFn
   get: GetFn
   logger: LoggerLike
-  /** Provided by the loader so the apply's child contexts can address us. */
-  fiber?: { entry?: { options?: { id?: string } } }
+  /**
+   * The `llm` service as cordis exposes it on the context.
+   *
+   * `dsh-llm-pi-ai` reaches the runtime this way (`ctx.llm.registerAdapter(…)`)
+   * rather than through `ctx.get('llm')`. The difference is not cosmetic: a
+   * cordis service property is a proxy that binds `this.ctx` to the *caller's*
+   * context at call time, which is what routes the registration's effect into
+   * this plugin's fiber so unloading disposes it. `ctx.get()` returns the raw
+   * service, whose effects land on the service's own fiber.
+   */
+  llm?: LlmRuntime
 }
 
+/** Where the mount journal is written. Readable from outside the app. */
+const MOUNT_JOURNAL_PATH = join(homedir(), '.dsh', 'workbuddy-bridge-mount.json')
+
 export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): void {
+  // A mount journal on disk. `ctx.logger` goes to the Electron console, which
+  // is not readable from outside the app, so a failed mount is otherwise
+  // invisible: `apply()` returns, the fiber stays alive, and the only symptom
+  // is a route that never appears. Recording each step turns that into
+  // something diagnosable after the fact.
+  const journal = new MountJournal()
+
+  journal.record('apply', 'entered', {
+    hasConfig: config !== undefined && config !== null,
+    providers: config?.providers === undefined ? 'undefined' : Object.keys(config.providers),
+  })
+
   const route = config.providers.workbuddy
 
   if (route === undefined) {
+    journal.record('apply', 'aborted', { reason: 'no providers.workbuddy in the delivered config' })
     ctx.logger.info(
       'workbuddy: no provider route configured yet. Set providers.workbuddy in DSH Models page to attach.',
     )
@@ -132,30 +159,87 @@ export function apply(ctx: WorkbuddyPluginContext, config: WorkbuddyConfig): voi
     return
   }
 
+  journal.record('apply', 'route resolved', {
+    apiKeyEnv: route.apiKeyEnv,
+    baseURL: route.baseURL,
+    realm: route.realm,
+  })
+
   // Resolve API key. We try (in order):
   //   1. route.apiKey (test override or literal user value)
   //   2. ctx.credentials resolving the env-var name from route.apiKeyEnv
   //   3. the env var directly (fallback when no credentials service exists)
-  resolveApiKey(ctx, route).then((apiKey) => {
-    if (apiKey === undefined) {
-      ctx.logger.warn(
-        `workbuddy: no API key resolved (apiKeyEnv="${route.apiKeyEnv}"). ` +
-          'Set the env var or enter the key in DSH Models page.',
-      )
-      // Mount the OAuth flow anyway so the user can sign in.
-      mountOAuthFlow(ctx, route).catch((e) => ctx.logger.error(`workbuddy oauth: ${(e as Error).message}`))
-      return
+  resolveApiKey(ctx, route)
+    .then((apiKey) => {
+      if (apiKey === undefined) {
+        journal.record('resolveApiKey', 'failed', {
+          apiKeyEnv: route.apiKeyEnv,
+          hint: 'not in the credential store and not in process.env',
+        })
+        ctx.logger.warn(
+          `workbuddy: no API key resolved (apiKeyEnv="${route.apiKeyEnv}"). ` +
+            'Set the env var or enter the key in DSH Models page.',
+        )
+        // Mount the OAuth flow anyway so the user can sign in.
+        return mountOAuthFlow(ctx, route).catch((e) =>
+          ctx.logger.error(`workbuddy oauth: ${(e as Error).message}`),
+        )
+      }
+      journal.record('resolveApiKey', 'resolved', { length: apiKey.length })
+      return mountEverything(ctx, route, apiKey, journal).catch((e) => {
+        journal.record('mountEverything', 'THREW', {
+          name: (e as Error)?.name,
+          message: (e as Error)?.message,
+          code: (e as { code?: string })?.code,
+          stack: ((e as Error)?.stack ?? '').split('\n').slice(0, 6).join('\n'),
+        })
+        ctx.logger.error(`workbuddy host mount failed: ${(e as Error).message}`)
+      })
+    })
+    .catch((e) => {
+      journal.record('apply', 'unexpected rejection', {
+        message: (e as Error)?.message,
+        stack: ((e as Error)?.stack ?? '').split('\n').slice(0, 6).join('\n'),
+      })
+    })
+}
+
+/**
+ * Append-only record of how far the mount got.
+ *
+ * Writes the whole document after every step so the file is readable even when
+ * the process dies mid-mount. Deliberately never throws: a diagnostic that can
+ * break the thing it diagnoses is worse than no diagnostic.
+ */
+class MountJournal {
+  private readonly steps: Array<Record<string, unknown>> = []
+
+  constructor() {
+    this.record('module', 'apply() called')
+  }
+
+  record(step: string, outcome: string, detail?: Record<string, unknown>): void {
+    const entry = { at: new Date().toISOString(), step, outcome, ...(detail ?? {}) }
+    this.steps.push(entry)
+    try {
+      writeFileSync(MOUNT_JOURNAL_PATH, JSON.stringify({ steps: this.steps }, null, 2), 'utf8')
+    } catch {
+      // A diagnostic must never be the reason a mount fails.
     }
-    mountEverything(ctx, route, apiKey).catch((e) =>
-      ctx.logger.error(`workbuddy host mount failed: ${(e as Error).message}`),
-    )
-  })
+    try {
+      // eslint-disable-next-line no-console
+      console.log(`workbuddy[mount] ${step}: ${outcome}`, detail ?? '')
+    } catch {
+      // console may be absent in a packaged renderer; ignore.
+    }
+  }
 }
 
 async function mountEverything(
   ctx: WorkbuddyPluginContext,
   route: WorkbuddyProviderConfig,
   apiKey: string,
+  journal: MountJournal,
 ): Promise<void> {
   const baseURL = (route.baseURL ?? DEFAULT_WB2API_BASEURL).replace(/\/+$/, '')
   const realm = route.realm
@@ -181,24 +265,38 @@ async function mountEverything(
   ctx.logger.info(
     `workbuddy: management server bound at ${mgmt.baseURL}${COST_METER_CREDITS_PATH}`,
   )
+  journal.record('managementServer', 'listening', { port: mgmt.port, baseURL: mgmt.baseURL })
 
   // 2) LLM adapter (M02 contract). The adapter implements the
   //    official `LlmAdapter` abstract class shape via a type-only
   //    import; the runtime duck-types it (no instanceof check).
   const adapter = new WorkbuddyLlmAdapter(client)
+  journal.record('adapter', 'constructed')
 
-  // 3) Get the `llm` service and register the route. We use the
-  //    official `LlmRuntime` type so the calls below are checked
-  //    against the shapes the DSH bundle actually provides.
-  const llm = ctx.get('llm') as LlmRuntime | undefined
+  // 3) Reach the `llm` service. `ctx.llm` is the access the shipped
+  //    dsh-llm-pi-ai uses; `ctx.get('llm')` is kept as a fallback so a
+  //    context that exposes only the lookup still works. Which one answered
+  //    is recorded, because the two are not equivalent: only the property
+  //    form routes the registration's effect into this plugin's fiber.
+  const llmProperty = ctx.llm
+  const llmFromLookup = ctx.get('llm') as LlmRuntime | undefined
+  const llm = llmProperty ?? llmFromLookup
+
+  journal.record('llm service', llm === undefined ? 'UNAVAILABLE' : 'found', {
+    via: llmProperty !== undefined ? 'ctx.llm' : llmFromLookup !== undefined ? "ctx.get('llm')" : 'neither',
+    typeofLlm: typeof llmProperty,
+    lookupTypeof: typeof llmFromLookup,
+    hasRegisterAdapter: llm === undefined ? 'n/a' : typeof llm.registerAdapter,
+  })
 
   if (llm === undefined) {
-    ctx.logger.error('workbuddy: ctx.get("llm") returned undefined; LLM route not registered')
+    ctx.logger.error('workbuddy: the llm service is unreachable; LLM route not registered')
   } else {
     // 3a) Register the adapter for the workbuddy route. The runtime
     //     validates `providerInfo().id === provider` and rejects
-    //     duplicates (M02 evidence, LlmRuntime.prepareRoutes).
+    //     duplicates (LlmRuntime.prepareRoutes).
     const handle = llm.registerAdapter([WORKBUDDY_PROVIDER], adapter)
+    journal.record('registerAdapter', 'ok', { provider: WORKBUDDY_PROVIDER })
     ctx.effect(function* () {
       yield () => handle()
     }, 'workbuddy: llm adapter lifecycle')
@@ -208,6 +306,7 @@ async function mountEverything(
     const dirHandle = llm.registerConfigurableProviders([
       workbuddyConfigurableProvider(settingsNs),
     ])
+    journal.record('registerConfigurableProviders', 'ok', { settingsNs })
     ctx.effect(function* () {
       yield () => dirHandle()
     }, 'workbuddy: llm directory lifecycle')
@@ -225,14 +324,31 @@ async function mountEverything(
       return list.map((m) => ({ id: m.id, ...(m.name !== undefined ? { name: m.name } : {}) }))
     }
     const discoverHandle = llm.registerModelDiscovery(settingsNs, discover)
+    journal.record('registerModelDiscovery', 'ok', { settingsNs })
     ctx.effect(function* () {
       yield () => discoverHandle()
     }, 'workbuddy: model discovery lifecycle')
+
+    // Probe the gateway once so the journal records whether the route can
+    // actually answer, rather than only that it was accepted.
+    try {
+      const models = await adapter.listModels(WORKBUDDY_PROVIDER)
+      journal.record('listModels', 'ok', {
+        count: models.length,
+        first: models.slice(0, 4).map((m) => m.id),
+      })
+    } catch (e) {
+      journal.record('listModels', 'FAILED', {
+        message: (e as Error)?.message,
+        code: (e as { code?: string })?.code,
+      })
+    }
 
     ctx.logger.info(
       `workbuddy: LLM route "${WORKBUDDY_PROVIDER}" registered against ${baseURL} ` +
         `(management port ${mgmt.port}, realm ${realm}, settingsNs "${settingsNs}")`,
     )
+    journal.record('mountEverything', 'complete', { managementPort: mgmt.port })
   }
 
   // 4) OAuth flow (M10 contract).
