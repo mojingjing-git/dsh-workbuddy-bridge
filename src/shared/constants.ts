@@ -26,5 +26,21 @@ export const OAUTH_TIMEOUT_MS = 5 * 60 * 1000
  */
 export const WORKBUDDY_OAUTH_CREDENTIAL_KEY = 'WORKBUDDY_OAUTH'
 
-/** Cache TTL for /v1/models (the wb2api response is a static 19-entry list). */
+/**
+ * How long the adapter serves its last `/v1/models` answer before re-asking.
+ *
+ * The list is **not** static, and an earlier version of this comment wrongly
+ * said it was. Two fetches an hour apart returned the same 19 ids in a
+ * different order — the gateway orders by account health, so models move as
+ * accounts cool down or recover, and the set itself changes as accounts are
+ * added:
+ *
+ *   10:34  hy3, glm-5.3, glm-5.2, glm-5.1, …
+ *   11:4x  minimax-m3, hy3-x, glm-5.3, glm-5.2, kimi-k3-1, …
+ *
+ * `LlmRuntime.listModels()` holds no cache of its own — it delegates to this
+ * adapter on every call — so this TTL is the only staleness the model list
+ * has. Short enough that a new gateway model appears without a DSH restart;
+ * long enough that a page redraw does not hit the network.
+ */
 export const MODELS_CACHE_TTL_MS = 60 * 1000
