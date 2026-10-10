@@ -280,6 +280,25 @@ async function mountOAuthFlow(
 }
 
 /**
+ * Local mirror of `@deepseek-ai/dsh-credentials`' `REF_PATTERN`.
+ *
+ * Duplicated rather than imported because the plugin must not import that
+ * package at runtime: DSH provides it through `ctx`, and importing it would
+ * load a second copy beside the bundle's own. If the upstream pattern ever
+ * widens, `credentialRef()` would accept names this rejects — the failure mode
+ * is a warning and a fall-through to the environment, not a crash.
+ */
+const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/** Branded credential reference; the brand is compile-time only. */
+type CredentialRef = string & { readonly __credentialRef?: unique symbol }
+
+/** The slice of the credentials service this plugin uses. */
+interface CredentialsLike {
+  resolve(ref: CredentialRef): Promise<{ value: string; source: string } | undefined>
+}
+
+/**
  * Resolve the wb2api API key for the workbuddy route.
  *
  * Order:
@@ -294,19 +313,45 @@ async function resolveApiKey(
   if (route.apiKey !== undefined && route.apiKey.length > 0) {
     return route.apiKey
   }
-  // Try DSH credentials first.
-  const credentials = ctx.get('credentials') as
-    | { resolve(ref: { name: string; value: string }): Promise<{ value: string } | undefined> }
-    | undefined
-  if (credentials !== undefined) {
-    try {
-      const hit = await credentials.resolve({ name: route.apiKeyEnv, value: '' })
-      if (hit !== undefined && hit.value.length > 0) return hit.value
-    } catch {
-      // fall through to env
+
+  // DSH's credential seam takes ONE branded reference, not the
+  // `{ name, value }` pair v0.1 invented. Verified against
+  // `@deepseek-ai/dsh-credentials`:
+  //
+  //   abstract resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined>
+  //   interface ResolvedCredential { value: string; source: string }
+  //
+  // A reference is a POSIX-shell-shaped name (`REF_PATTERN` is
+  // `^[A-Za-z_][A-Za-z0-9_]*$`). `credentialRef()` would brand it, but that
+  // helper lives in a package this plugin must not import at runtime, so the
+  // name is validated here with the same pattern and passed as a cast — the
+  // brand is a compile-time marker and the runtime value is the string.
+  //
+  // This is the path that makes an ordinary `apiKeyEnv` work: DSH stores the
+  // key in its credential file under the env var's name, so requiring the user
+  // to ALSO export a real environment variable would be wrong.
+  if (!CREDENTIAL_REF_PATTERN.test(route.apiKeyEnv)) {
+    ctx.logger.warn(
+      `workbuddy: apiKeyEnv "${route.apiKeyEnv}" is not a valid credential reference ` +
+        `(must match ${String(CREDENTIAL_REF_PATTERN)}); skipping the credential lookup`,
+    )
+  } else {
+    const credentials = ctx.get('credentials') as CredentialsLike | undefined
+    if (credentials !== undefined) {
+      try {
+        const hit = await credentials.resolve(route.apiKeyEnv as CredentialRef)
+        if (hit !== undefined && hit.value.length > 0) return hit.value
+      } catch (e) {
+        ctx.logger.warn(
+          `workbuddy: credential lookup for "${route.apiKeyEnv}" failed: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
     }
   }
-  // Plain environment fallback.
+
+  // Plain environment fallback, for a deployment that exports the variable
+  // rather than storing it in DSH's credential file.
   const v = process.env[route.apiKeyEnv]
   if (typeof v === 'string' && v.length > 0) return v
   return undefined
