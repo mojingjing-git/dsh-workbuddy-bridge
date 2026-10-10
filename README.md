@@ -4,11 +4,19 @@ DSH plugin that brings the WorkBuddy / CodeBuddy OAuth account flow into
 DeepSeek Harness (DSH) as a first-class experience: authentication, model
 selection, balance observation, and an optionally self-managed gateway.
 
-> **Status: Batch 2 in progress.** The plugin builds, type-checks and passes
-> 83 tests, but it has **not** been through its acceptance gate — a real DSH
-> desktop Agent completing a tool call. Until that run happens, treat every
-> claim below as "covered by a test", not "observed working". See
-> [Verification](#verification) for exactly what is and is not proven.
+> **Status: the LLM path works on a real desktop; the product around it does
+> not exist yet.** A real DSH Desktop Agent has completed a tool call through
+> this plugin — the round trip is recorded in
+> [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) with the environment, commits and
+> the gateway log lines it is read from, and the adapter checks are
+> reproducible with `scripts/manual/`.
+>
+> What is **not** done: OAuth sign-in, the client UI, and the balance panel's
+> end-to-end integration. Those are Batch 3. Specifically, do not read "the
+> plugin works" as "the plugin is usable" — you can select a model and run an
+> Agent turn today; you cannot sign in or see a balance from inside DSH.
+> [`docs/ACCEPTANCE.md` §6](docs/ACCEPTANCE.md#6-not-covered) lists the gaps in
+> full.
 
 ## What this is
 
@@ -39,9 +47,10 @@ is always the one who installs or upgrades the gateway.
 
 | Component | Version |
 | --- | --- |
-| DSH | `>=0.2.1-alpha.2 <0.3.0-0` |
+| DSH | `>=0.2.1-alpha.2 <0.3.0-0` (developed and accepted against the Desktop app reporting `0.2.0-rc.2`) |
 | Node | `>=20` |
-| WorkBuddy2API gateway | `v1.13.0` (the version the contracts were probed against) |
+| WorkBuddy2API gateway | `v1.13.0` (the version the contracts were probed against; the live endpoint reports `1.13.0-panel`) |
+| `dsh-cost-meter` | `1.8.15` — only for balance observation; the balance contract is pinned to this version's parser |
 
 The DSH pin is exact on purpose. `0.0.1-rc.1` — what npm's `latest` tag
 resolves to — has a different `TokenUsage` (no `totalTokens`) and a different
@@ -66,6 +75,48 @@ setx WB2API_API_KEY "<api_key from the gateway's config.json>"
 
 Restart DSH desktop. The plugin's `cordis.patch.yml` is read at startup, so a
 page refresh is not enough.
+
+## Connecting the balance panel
+
+The plugin listens on a loopback management endpoint that `dsh-cost-meter`
+reads. **Nothing connects the two automatically** — cost-meter's gateway sources
+are its own configuration, and it authenticates with a credential name derived
+from the source id you choose. Three steps:
+
+1. **Find the endpoint.** The plugin records it in
+   `~/.dsh/workbuddy-bridge-mount.json`:
+
+   ```json
+   { "step": "managementServer", "outcome": "listening",
+     "baseURL": "http://127.0.0.1:7710",
+     "path": "/v0/management/plugins/workbuddy/credits",
+     "keyCredentialRef": "WORKBUDDY_MANAGEMENT_KEY" }
+   ```
+
+   The port is `managementPort` in the plugin config, default **7710**. It is
+   fixed rather than random precisely so this is a one-off: `0` would ask for an
+   ephemeral port and you would re-read it after every restart.
+
+2. **Add a gateway source in `dsh-cost-meter`** with type `workbuddy` and that
+   `baseURL`. It then reads one read-only path — the plugin touches nothing
+   else of cost-meter's.
+
+3. **Copy the key across.** The plugin stores its management key in DSH's
+   credential store under **`WORKBUDDY_MANAGEMENT_KEY`** — generated once with
+   `randomBytes(32)` and then reused, so it survives restarts. cost-meter reads
+   a differently-named variable of its own, derived from the source id you
+   picked (`CLIPROXYAPI_MANAGEMENT_KEY_<SOURCE_ID>_<HASH>`, see
+   `managementKeyVarOf` in dsh-cost-meter). Add that credential with the same
+   value. cost-meter's settings page names the variable it wants once the source
+   exists, so create the source first and copy the value into that name.
+
+The plugin's diagnostics record which credential to copy and whether the key was
+found or generated. They never record the key.
+
+**This integration has not been exercised end to end.** The payload contract is
+tested against cost-meter's own parser, but no balance has been displayed in the
+UI on a real install. See
+[`docs/ACCEPTANCE.md` §5](docs/ACCEPTANCE.md#5-cost-meter--contract-verified-integration-not).
 
 ## Architecture
 
