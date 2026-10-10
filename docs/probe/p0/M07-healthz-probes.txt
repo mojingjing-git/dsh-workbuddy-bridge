@@ -1,0 +1,15 @@
+--- M07a: /healthz with no auth header ---
+{"healthy":2,"realm_servable":{"cn":true,"global":false},"service":"workbuddy2api","total":2}
+--- HTTP 200 ---
+--- M07b: /v1/chat/completions with no auth (should be 401) ---
+{"error":{"code":"invalid_api_key","message":"missing or invalid API key","type":"api_error"}}
+--- HTTP 401 ---
+--- M07c: /v1/chat/completions with WRONG auth (should be 401) ---
+{"error":{"code":"invalid_api_key","message":"missing or invalid API key","type":"api_error"}}
+--- HTTP 401 ---
+--- M07d: /v1/chat/completions on locked model (glm-5.2 in cooldown) should be 503/400 model_unavailable ---
+{"choices":[{"finish_reason":"length","index":0,"message":{"content":"Hi there! I'm","role":"assistant"}}],"created":1791571874,"id":"9b164f71171704f368b1e04e806d981a","model":"glm-5.2-x","object":"chat.completion","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cached_tokens":0,"completion_thinking_tokens":0,"completion_tokens":5,"completion_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"cached_tokens":0,"reasoning_tokens":0,"rejected_prediction_tokens":0},"credit":0,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":7,"prompt_cache_write_tokens":0,"prompt_tokens":7,"prompt_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"cached_tokens":0,"reasoning_tokens":0,"rejected_prediction_tokens":0},"total_tokens":12}}
+--- HTTP 200 ---
+--- M07e: /v1/chat/completions on UNLOCKED model cn:auto (should be 200) ---
+{"choices":[{"finish_reason":"length","index":0,"message":{"content":"","reasoning_content":"We are in","role":"assistant"}}],"created":1791571876,"id":"161aa8823de2c0a2216023955279664f","model":"hy4-preview-f","object":"chat.completion","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cached_tokens":0,"completion_thinking_tokens":5,"completion_tokens":5,"completion_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"cached_tokens":0,"reasoning_tokens":5,"rejected_prediction_tokens":0},"credit":0,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":22,"prompt_cache_write_tokens":0,"prompt_tokens":22,"prompt_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"cached_tokens":0,"reasoning_tokens":0,"rejected_prediction_tokens":0},"total_tokens":27}}
+--- HTTP 200 ---

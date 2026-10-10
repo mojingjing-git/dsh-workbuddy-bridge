@@ -1,0 +1,10 @@
+{
+  "name": "dsh-workbuddy-bridge",
+  "description": "将本地 WorkBuddy2API 网关接入 DeepSeek Harness。",
+  "workbuddy.status.configured": "WorkBuddy：{realm}",
+  "workbuddy.status.off": "WorkBuddy：未配置",
+  "workbuddy.status.starting": "WorkBuddy：启动中…",
+  "workbuddy.action.signIn": "使用 WorkBuddy 登录",
+  "workbuddy.error.noKey": "未解析到 API Key。请设置 {env} 或在 DSH Models 页面粘贴 Key。",
+  "workbuddy.error.noRoute": "未配置 provider 路由。请在 DSH Models 页面设置 providers.workbuddy。"
+}

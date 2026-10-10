@@ -1,0 +1,2 @@
+{"error":{"code":"model_unavailable","gateway_hint":"model_blocked: 2 account(s) cooling down this model; earliest unblock at 2026-10-10T08:50:20+08:00; upstream: 11102 model not available","message":"model is unavailable on every account (per-model cooldown), try another model","type":"api_error"}}
+--- HTTP 400 ---
